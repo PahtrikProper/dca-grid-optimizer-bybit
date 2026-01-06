@@ -965,6 +965,10 @@ if __name__ == "__main__":
     if not intervals:
         intervals = ["1", "3", "5", "15"]
 
+    # Enforce live-like leverage usage: fixed at 10x for now
+    if float(args.leverage) != 10.0:
+        raise ValueError("Leverage must be 10x to align with the intended live trading setup.")
+
     # -----------------------------
     # Base / Defaults
     # -----------------------------
