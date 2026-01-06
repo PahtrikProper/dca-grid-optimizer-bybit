@@ -956,7 +956,7 @@ if __name__ == "__main__":
     parser.add_argument("--symbol", default="SOLUSDT", help="Instrument symbol (e.g., SOLUSDT).")
     parser.add_argument("--category", default="linear", help="Bybit category: linear, inverse, spot.")
     parser.add_argument("--intervals", default="1,3,5,15", help="Comma-separated candle intervals (e.g., 1,3,5,15).")
-    parser.add_argument("--hours-back", type=float, default=48.0, help="Lookback window in hours (default: 48).")
+    parser.add_argument("--hours-back", type=float, default=90 * 24, help="Lookback window in hours (default: 90 days).")
     parser.add_argument("--trials", type=int, default=1000, help="Number of optimizer trials.")
     parser.add_argument("--keep-top", type=int, default=20, help="Number of top configs to keep.")
     parser.add_argument("--budget-frac", type=float, default=0.95, help="Max planned margin fraction of starting equity.")
