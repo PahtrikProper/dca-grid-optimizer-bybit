@@ -415,21 +415,21 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         pos.vwap = px
         pos.add_fill(Fill(exec_ts(i), fill_side, qty, px, fee, "ENTRY"))
 
-    def add_to_position(i: int, mid: float):
+    def add_to_position(i: int, mid: float) -> bool:
         nonlocal equity, pos
         assert pos is not None
         if pos.add_count >= cfg.max_adds:
-            return
+            return False
 
         adverse = pos.adverse_move_pct(mid)
         next_step = cfg.add_step_pct * (pos.add_count + 1)
         if adverse < next_step:
-            return
+            return False
 
         add_margin = equity * cfg.add_margin_frac * (cfg.size_mult ** pos.add_count)
         add_margin = min(add_margin, equity)
         if add_margin <= 0:
-            return
+            return False
 
         notional = add_margin * cfg.leverage
         fill_side = "BUY" if pos.side == "LONG" else "SELL"
@@ -447,6 +447,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         pos.add_count += 1
 
         pos.add_fill(Fill(exec_ts(i), fill_side, qty, px, fee, f"ADD_{pos.add_count}"))
+        return True
 
     def should_take_profit(mid: float) -> bool:
         assert pos is not None
@@ -521,17 +522,21 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
 
         # Manage open position
         if pos is not None:
+            # Single action per bar to mimic discrete decision/placement flow
             if liquidated(mid, pos):
                 close_position(i, mid, "LIQUIDATED")
                 continue
 
-            add_to_position(i, mid)
-
             if should_take_profit(mid):
                 close_position(i, mid, "BASKET_TP")
                 continue
+
             if should_time_stop(i):
                 close_position(i, mid, "TIME_STOP")
+                continue
+
+            add_executed = add_to_position(i, mid)
+            if add_executed:
                 continue
 
             continue
