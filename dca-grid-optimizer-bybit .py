@@ -372,6 +372,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
     equity = cfg.initial_equity
     start_equity = equity
     peak_equity = equity
+    total_fees = 0.0
 
     pos: Optional[BasketPosition] = None
     trades: List[Trade] = []
@@ -413,6 +414,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         qty = notional / px
 
         fee = fee_for_notional(notional, cfg)
+        total_fees += fee
         equity -= fee
         equity -= margin
         pos.margin_used += margin
@@ -443,6 +445,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         qty = notional / px
 
         fee = fee_for_notional(notional, cfg)
+        total_fees += fee
         equity -= fee
         equity -= add_margin
         pos.margin_used += add_margin
@@ -478,6 +481,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
 
         notional = abs(pos.qty * px)
         fee = fee_for_notional(notional, cfg)
+        total_fees += fee
         equity -= fee
 
         pnl = pos.unrealized_pnl(px)
@@ -577,6 +581,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
     losses = sum(1 for t in trades if t.pnl <= 0)
     win_rate = wins / max(1, (wins + losses))
     max_dd = max_drawdown(eq_df["equity"]) if len(eq_df) else 0.0
+    avg_realized_pnl_pct = float(np.mean([t["pnl_pct_on_margin"] for t in trades])) if trades else 0.0
 
     return {
         "config": asdict(cfg),
@@ -588,6 +593,8 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         "losses": losses,
         "win_rate": win_rate,
         "max_drawdown_pct": max_dd,
+        "total_fees": total_fees,
+        "avg_realized_pnl_pct": avg_realized_pnl_pct,
         "equity_curve": eq_df,
         "trades": [asdict(t) for t in trades],
     }
@@ -767,6 +774,8 @@ def run_optimizer(
             "num_trades": int(res["num_trades"]),
             "win_rate": float(res["win_rate"]),
             "max_drawdown_pct": float(res["max_drawdown_pct"]),
+            "avg_realized_pnl_pct": float(res.get("avg_realized_pnl_pct", 0.0)),
+            "total_fees": float(res.get("total_fees", 0.0)),
             "config": res["config"],
         }
 
@@ -806,6 +815,8 @@ def save_best_outputs(best: List[Dict[str, Any]], out_dir: str = ".") -> None:
             "num_trades": b["num_trades"],
             "win_rate": b["win_rate"],
             "max_drawdown_pct": b["max_drawdown_pct"],
+            "avg_realized_pnl_pct": b["avg_realized_pnl_pct"],
+            "total_fees": b["total_fees"],
 
             # Core params
             "bb_len": c["bb_len"],
@@ -907,6 +918,7 @@ def run_full_workflow_for_interval(
         print(
             f"{i}) score={b['score']:.2f} final_eq={b['final_equity']:.2f} "
             f"dd={b['max_drawdown_pct']*100:.2f}% trades={b['num_trades']} win={b['win_rate']*100:.1f}% "
+            f"avg_pnl%={b['avg_realized_pnl_pct']*100:.3f}% fees={b['total_fees']:.4f} "
             f"tp={c['basket_tp_pct']:.4f} step={c['add_step_pct']:.4f} mult={c['size_mult']:.2f} "
             f"adds={c['max_adds']} base={c['base_margin_frac']:.4f} add={c['add_margin_frac']:.4f} "
             f"bb=({c['bb_len']},{c['bb_stdev']:.2f}) rsi=({c['rsi_len']},{c['rsi_oversold']:.1f}/{c['rsi_overbought']:.1f}) "
@@ -964,10 +976,6 @@ if __name__ == "__main__":
     intervals = _parse_intervals(args.intervals)
     if not intervals:
         intervals = ["1", "3", "5", "15"]
-
-    # Enforce live-like leverage usage: fixed at 10x for now
-    if float(args.leverage) != 10.0:
-        raise ValueError("Leverage must be 10x to align with the intended live trading setup.")
 
     # -----------------------------
     # Base / Defaults
