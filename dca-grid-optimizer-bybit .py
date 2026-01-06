@@ -18,6 +18,7 @@ import os
 import time
 import json
 import random
+import argparse
 import requests
 import pandas as pd
 import numpy as np
@@ -923,23 +924,64 @@ def run_full_workflow_for_interval(
 
     return best, best_res
 
+
+def _parse_intervals(arg: str) -> List[str]:
+    raw = [x.strip() for x in str(arg).split(",") if x.strip()]
+    return raw if raw else ["1", "3", "5", "15"]
+
+
+def _parse_optional_float(val: Optional[str]) -> Optional[float]:
+    if val is None:
+        return None
+    val = str(val).strip()
+    if val == "":
+        return None
+    return float(val)
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DCA/grid-ish optimizer backtester (Bybit public data).")
+    parser.add_argument("--symbol", default="SOLUSDT", help="Instrument symbol (e.g., SOLUSDT).")
+    parser.add_argument("--category", default="linear", help="Bybit category: linear, inverse, spot.")
+    parser.add_argument("--intervals", default="1,3,5,15", help="Comma-separated candle intervals (e.g., 1,3,5,15).")
+    parser.add_argument("--hours-back", type=float, default=48.0, help="Lookback window in hours (default: 48).")
+    parser.add_argument("--trials", type=int, default=1000, help="Number of optimizer trials.")
+    parser.add_argument("--keep-top", type=int, default=20, help="Number of top configs to keep.")
+    parser.add_argument("--budget-frac", type=float, default=0.95, help="Max planned margin fraction of starting equity.")
+    parser.add_argument("--seed", type=int, default=1337, help="Random seed for reproducibility.")
+    parser.add_argument("--initial-equity", type=float, default=400.0, help="Starting equity.")
+    parser.add_argument("--leverage", type=float, default=10.0, help="Leverage for position sizing.")
+    parser.add_argument("--margin-mode", default="cross", help='Margin mode: "cross" or "isolated".')
+    parser.add_argument("--maker-fee", type=float, default=0.0002, help="Maker fee rate.")
+    parser.add_argument("--taker-fee", type=float, default=0.0006, help="Taker fee rate.")
+    parser.add_argument("--use-maker", action="store_true", help="Use maker fees/pricing instead of taker.")
+    parser.add_argument("--spread-bps", type=float, default=2.0, help="Spread in basis points applied to mid.")
+    parser.add_argument("--slippage-bps", type=float, default=1.0, help="Slippage in basis points applied to mid.")
+    parser.add_argument("--equity-dd-stop-pct", default=None, help="Optional equity drawdown stop vs. start equity (e.g., 0.6).")
+    parser.add_argument("--out-root", default="results", help="Output directory root for per-interval results.")
+    args = parser.parse_args()
+
+    intervals = _parse_intervals(args.intervals)
+    if not intervals:
+        intervals = ["1", "3", "5", "15"]
+
     # -----------------------------
     # Base / Defaults
     # -----------------------------
     base_cfg = Config(
-        initial_equity=400.0,
-        leverage=10.0,
+        initial_equity=float(args.initial_equity),
+        leverage=float(args.leverage),
+        margin_mode=str(args.margin_mode),
 
         # fees + execution costs (already modeled in engine)
-        maker_fee=0.0002,
-        taker_fee=0.0006,
-        use_taker=True,
-        spread_bps=2.0,
-        slippage_bps=1.0,
+        maker_fee=float(args.maker_fee),
+        taker_fee=float(args.taker_fee),
+        use_taker=not bool(args.use_maker),
+        spread_bps=float(args.spread_bps),
+        slippage_bps=float(args.slippage_bps),
 
         # keep Duncan-ish: no stop by default
-        equity_dd_stop_pct=None,
+        equity_dd_stop_pct=_parse_optional_float(args.equity_dd_stop_pct),
 
         maintenance_margin_rate=0.005,
     )
@@ -947,21 +989,20 @@ if __name__ == "__main__":
     # -----------------------------
     # Market / Data Settings
     # -----------------------------
-    symbol = "SOLUSDT"
-    category = "linear"   # USDT perps
-    intervals = ["1", "3", "5", "15"]  # run multiple granularities
+    symbol = args.symbol
+    category = args.category   # USDT perps by default
 
-    # last 90 days window
+    # window
     end = pd.Timestamp.utcnow()
-    start = end - pd.Timedelta(days=90)
+    start = end - pd.Timedelta(hours=float(args.hours_back))
 
     # -----------------------------
     # Optimizer Settings
     # -----------------------------
-    N_TRIALS = 1000
-    KEEP_TOP = 20
-    BUDGET_FRAC = 0.95
-    SEED = 1337
+    N_TRIALS = int(args.trials)
+    KEEP_TOP = int(args.keep_top)
+    BUDGET_FRAC = float(args.budget_frac)
+    SEED = int(args.seed) if args.seed is not None else None
 
 
     # Run workflow for each interval, keeping outputs separate
@@ -977,7 +1018,7 @@ if __name__ == "__main__":
             keep_top=KEEP_TOP,
             budget_frac=BUDGET_FRAC,
             seed=SEED,
-            out_root="results",
+            out_root=args.out_root,
         )
 
 # ---- chunk 4 ends here ----
