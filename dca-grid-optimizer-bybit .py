@@ -395,15 +395,6 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
     def exec_mid(i: int) -> float:
         return float(open_px.iloc[exec_idx(i)])
 
-    def exec_idx(i: int) -> int:
-        return min(i + 1, len(df) - 1)
-
-    def exec_ts(i: int) -> Any:
-        return df["ts"].iloc[exec_idx(i)]
-
-    def exec_mid(i: int) -> float:
-        return float(open_px.iloc[exec_idx(i)])
-
     def open_position(side: str, i: int, mid: float):
         nonlocal equity, pos
         pos = BasketPosition(side=side)
@@ -886,6 +877,9 @@ def run_full_workflow_for_interval(
     out_root: str = "results",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     print(f"\n=== Interval {interval}m ===")
+    if base_cfg.leverage > 1.0 and str(category).lower() == "spot":
+        raise ValueError("Leverage > 1 requires a derivative category (linear or inverse), not spot.")
+
     df = load_or_fetch_ohlcv(symbol, category, interval, start, end)
     print(f"Data rows: {len(df)}  |  {symbol} {category} {interval}  |  {start} -> {end}")
     print(f"Running optimizer: trials={n_trials}, keep_top={keep_top}, margin_budget={budget_frac*100:.0f}%")
