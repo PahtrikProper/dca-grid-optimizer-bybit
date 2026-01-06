@@ -581,7 +581,10 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
     losses = sum(1 for t in trades if t.pnl <= 0)
     win_rate = wins / max(1, (wins + losses))
     max_dd = max_drawdown(eq_df["equity"]) if len(eq_df) else 0.0
-    avg_realized_pnl_pct = float(np.mean([t["pnl_pct_on_margin"] for t in trades])) if trades else 0.0
+    pnl_pcts = [t.pnl_pct_on_margin for t in trades]
+    avg_realized_pnl_pct = float(np.mean(pnl_pcts)) if pnl_pcts else 0.0
+    win_pcts = [t.pnl_pct_on_margin for t in trades if t.pnl > 0]
+    avg_win_pnl_pct = float(np.mean(win_pcts)) if win_pcts else 0.0
 
     return {
         "config": asdict(cfg),
@@ -595,6 +598,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         "max_drawdown_pct": max_dd,
         "total_fees": total_fees,
         "avg_realized_pnl_pct": avg_realized_pnl_pct,
+        "avg_win_pnl_pct": avg_win_pnl_pct,
         "equity_curve": eq_df,
         "trades": [asdict(t) for t in trades],
     }
@@ -720,6 +724,9 @@ def score_result(res: Dict[str, Any]) -> float:
     """
     final_eq = float(res.get("final_equity", 0.0))
     dd = float(res.get("max_drawdown_pct", 0.0))
+    avg_pnl_pct = float(res.get("avg_realized_pnl_pct", 0.0))
+    avg_win_pnl_pct = float(res.get("avg_win_pnl_pct", 0.0))
+    num_trades = int(res.get("num_trades", 0))
 
     # liquidation detection from trade fills
     liq = 0
@@ -736,7 +743,12 @@ def score_result(res: Dict[str, Any]) -> float:
     # Drawdown penalty: scale by equity so score units match
     # Score = final_eq - (dd_penalty * final_eq)
     dd_penalty = 1.25 * dd  # harsher penalty than 1:1
-    return final_eq * (1.0 - dd_penalty)
+    base_score = final_eq * (1.0 - dd_penalty)
+
+    # Consistency bonus: reward higher average PnL% and winning TP-like exits, scaled by trade count (cap at 10)
+    trade_factor = min(num_trades, 10)
+    consistency_bonus = final_eq * 0.05 * trade_factor * max(0.0, (avg_pnl_pct + avg_win_pnl_pct))
+    return base_score + consistency_bonus
 
 def run_optimizer(
     df: pd.DataFrame,
@@ -816,6 +828,7 @@ def save_best_outputs(best: List[Dict[str, Any]], out_dir: str = ".") -> None:
             "win_rate": b["win_rate"],
             "max_drawdown_pct": b["max_drawdown_pct"],
             "avg_realized_pnl_pct": b["avg_realized_pnl_pct"],
+            "avg_win_pnl_pct": b.get("avg_win_pnl_pct", 0.0),
             "total_fees": b["total_fees"],
 
             # Core params
@@ -918,7 +931,7 @@ def run_full_workflow_for_interval(
         print(
             f"{i}) score={b['score']:.2f} final_eq={b['final_equity']:.2f} "
             f"dd={b['max_drawdown_pct']*100:.2f}% trades={b['num_trades']} win={b['win_rate']*100:.1f}% "
-            f"avg_pnl%={b['avg_realized_pnl_pct']*100:.3f}% fees={b['total_fees']:.4f} "
+            f"avg_pnl%={b['avg_realized_pnl_pct']*100:.3f}% avg_win_pnl%={b.get('avg_win_pnl_pct',0)*100:.3f}% fees={b['total_fees']:.4f} "
             f"tp={c['basket_tp_pct']:.4f} step={c['add_step_pct']:.4f} mult={c['size_mult']:.2f} "
             f"adds={c['max_adds']} base={c['base_margin_frac']:.4f} add={c['add_margin_frac']:.4f} "
             f"bb=({c['bb_len']},{c['bb_stdev']:.2f}) rsi=({c['rsi_len']},{c['rsi_oversold']:.1f}/{c['rsi_overbought']:.1f}) "
@@ -956,8 +969,8 @@ if __name__ == "__main__":
     parser.add_argument("--symbol", default="SOLUSDT", help="Instrument symbol (e.g., SOLUSDT).")
     parser.add_argument("--category", default="linear", help="Bybit category: linear, inverse, spot.")
     parser.add_argument("--intervals", default="1,3,5,15", help="Comma-separated candle intervals (e.g., 1,3,5,15).")
-    parser.add_argument("--hours-back", type=float, default=48.0, help="Lookback window in hours (default: 48).")
-    parser.add_argument("--trials", type=int, default=1000, help="Number of optimizer trials.")
+    parser.add_argument("--hours-back", type=float, default=90 * 24, help="Lookback window in hours (default: 90 days).")
+    parser.add_argument("--trials", type=int, default=10000, help="Number of optimizer trials (default: 10,000 per interval).")
     parser.add_argument("--keep-top", type=int, default=20, help="Number of top configs to keep.")
     parser.add_argument("--budget-frac", type=float, default=0.95, help="Max planned margin fraction of starting equity.")
     parser.add_argument("--seed", type=int, default=1337, help="Random seed for reproducibility.")
