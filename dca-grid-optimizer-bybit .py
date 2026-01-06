@@ -228,6 +228,7 @@ def bollinger(series: pd.Series, length: int = 20, stdev: float = 2.0) -> Tuple[
 class Config:
     initial_equity: float = 400.0
     leverage: float = 10.0
+    margin_mode: str = "cross"  # "cross" or "isolated" (cross uses all free equity in liquidation test)
     maker_fee: float = 0.0002
     taker_fee: float = 0.0006
     use_taker: bool = True
@@ -378,8 +379,21 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
     def liquidated(price: float, pos: BasketPosition) -> bool:
         notional = abs(pos.notional(price))
         maint = notional * cfg.maintenance_margin_rate
-        equity_in_pos = pos.margin_used + pos.unrealized_pnl(price)
-        return equity_in_pos <= maint
+        # Cross mode: all free equity counts toward maintenance
+        if str(cfg.margin_mode).lower() == "cross":
+            account_equity = equity + pos.margin_used + pos.unrealized_pnl(price)
+        else:
+            account_equity = pos.margin_used + pos.unrealized_pnl(price)
+        return account_equity <= maint
+
+    def exec_idx(i: int) -> int:
+        return min(i + 1, len(df) - 1)
+
+    def exec_ts(i: int) -> Any:
+        return df["ts"].iloc[exec_idx(i)]
+
+    def exec_mid(i: int) -> float:
+        return float(open_px.iloc[exec_idx(i)])
 
     def exec_idx(i: int) -> int:
         return min(i + 1, len(df) - 1)
