@@ -228,6 +228,7 @@ def bollinger(series: pd.Series, length: int = 20, stdev: float = 2.0) -> Tuple[
 class Config:
     initial_equity: float = 400.0
     leverage: float = 10.0
+    margin_mode: str = "cross"  # "cross" or "isolated" (cross uses all free equity in liquidation test)
     maker_fee: float = 0.0002
     taker_fee: float = 0.0006
     use_taker: bool = True
@@ -361,6 +362,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         df["ts"] = df.index
 
     close = df[cols["close"]].astype(float)
+    open_px = df[cols["open"]].astype(float)
 
     # Indicators
     bb_l, bb_m, bb_u = bollinger(close, cfg.bb_len, cfg.bb_stdev)
@@ -377,13 +379,26 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
     def liquidated(price: float, pos: BasketPosition) -> bool:
         notional = abs(pos.notional(price))
         maint = notional * cfg.maintenance_margin_rate
-        equity_in_pos = pos.margin_used + pos.unrealized_pnl(price)
-        return equity_in_pos <= maint
+        # Cross mode: all free equity counts toward maintenance
+        if str(cfg.margin_mode).lower() == "cross":
+            account_equity = equity + pos.margin_used + pos.unrealized_pnl(price)
+        else:
+            account_equity = pos.margin_used + pos.unrealized_pnl(price)
+        return account_equity <= maint
+
+    def exec_idx(i: int) -> int:
+        return min(i + 1, len(df) - 1)
+
+    def exec_ts(i: int) -> Any:
+        return df["ts"].iloc[exec_idx(i)]
+
+    def exec_mid(i: int) -> float:
+        return float(open_px.iloc[exec_idx(i)])
 
     def open_position(side: str, i: int, mid: float):
         nonlocal equity, pos
         pos = BasketPosition(side=side)
-        pos.entry_bar = i
+        pos.entry_bar = exec_idx(i)
 
         margin = equity * cfg.base_margin_frac
         margin = min(margin, equity)
@@ -393,7 +408,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
 
         notional = margin * cfg.leverage
         fill_side = "BUY" if side == "LONG" else "SELL"
-        px = apply_exec_price(mid, fill_side, cfg.spread_bps, cfg.slippage_bps)
+        px = apply_exec_price(exec_mid(i), fill_side, cfg.spread_bps, cfg.slippage_bps)
         qty = notional / px
 
         fee = fee_for_notional(notional, cfg)
@@ -403,27 +418,27 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
 
         pos.qty = qty
         pos.vwap = px
-        pos.add_fill(Fill(df["ts"].iloc[i], fill_side, qty, px, fee, "ENTRY"))
+        pos.add_fill(Fill(exec_ts(i), fill_side, qty, px, fee, "ENTRY"))
 
-    def add_to_position(i: int, mid: float):
+    def add_to_position(i: int, mid: float) -> bool:
         nonlocal equity, pos
         assert pos is not None
         if pos.add_count >= cfg.max_adds:
-            return
+            return False
 
         adverse = pos.adverse_move_pct(mid)
         next_step = cfg.add_step_pct * (pos.add_count + 1)
         if adverse < next_step:
-            return
+            return False
 
         add_margin = equity * cfg.add_margin_frac * (cfg.size_mult ** pos.add_count)
         add_margin = min(add_margin, equity)
         if add_margin <= 0:
-            return
+            return False
 
         notional = add_margin * cfg.leverage
         fill_side = "BUY" if pos.side == "LONG" else "SELL"
-        px = apply_exec_price(mid, fill_side, cfg.spread_bps, cfg.slippage_bps)
+        px = apply_exec_price(exec_mid(i), fill_side, cfg.spread_bps, cfg.slippage_bps)
         qty = notional / px
 
         fee = fee_for_notional(notional, cfg)
@@ -436,7 +451,8 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         pos.qty = new_qty
         pos.add_count += 1
 
-        pos.add_fill(Fill(df["ts"].iloc[i], fill_side, qty, px, fee, f"ADD_{pos.add_count}"))
+        pos.add_fill(Fill(exec_ts(i), fill_side, qty, px, fee, f"ADD_{pos.add_count}"))
+        return True
 
     def should_take_profit(mid: float) -> bool:
         assert pos is not None
@@ -457,7 +473,7 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         assert pos is not None
 
         fill_side = "SELL" if pos.side == "LONG" else "BUY"
-        px = apply_exec_price(mid, fill_side, cfg.spread_bps, cfg.slippage_bps)
+        px = apply_exec_price(exec_mid(i), fill_side, cfg.spread_bps, cfg.slippage_bps)
 
         notional = abs(pos.qty * px)
         fee = fee_for_notional(notional, cfg)
@@ -467,20 +483,21 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
         equity += pos.margin_used + pnl
 
         fills_dict = [asdict(f) for f in pos.fills]
-        fills_dict.append(asdict(Fill(df["ts"].iloc[i], fill_side, pos.qty, px, fee, reason)))
+        fills_dict.append(asdict(Fill(exec_ts(i), fill_side, pos.qty, px, fee, reason)))
 
         margin_total = pos.margin_used if pos.margin_used > 0 else 1e-9
+        holding_bars = exec_idx(i) - (pos.entry_bar if pos.entry_bar is not None else exec_idx(i))
         trades.append(
             Trade(
-                entry_ts=pos.fills[0].ts if pos.fills else df["ts"].iloc[i],
-                exit_ts=df["ts"].iloc[i],
+                entry_ts=pos.fills[0].ts if pos.fills else exec_ts(i),
+                exit_ts=exec_ts(i),
                 side=pos.side,
                 qty=pos.qty,
                 avg_entry=pos.vwap,
                 avg_exit=px,
                 pnl=pnl - sum(f.fee for f in pos.fills) - fee,
                 pnl_pct_on_margin=(pnl / margin_total),
-                bars_held=(i - (pos.entry_bar if pos.entry_bar is not None else i)),
+                bars_held=max(0, holding_bars),
                 fills=fills_dict
             )
         )
@@ -510,23 +527,31 @@ def backtest(df: pd.DataFrame, cfg: Config) -> Dict[str, Any]:
 
         # Manage open position
         if pos is not None:
+            # Single action per bar to mimic discrete decision/placement flow
             if liquidated(mid, pos):
                 close_position(i, mid, "LIQUIDATED")
                 continue
 
-            add_to_position(i, mid)
-
             if should_take_profit(mid):
                 close_position(i, mid, "BASKET_TP")
                 continue
+
             if should_time_stop(i):
                 close_position(i, mid, "TIME_STOP")
+                continue
+
+            add_executed = add_to_position(i, mid)
+            if add_executed:
                 continue
 
             continue
 
         # Entry logic (contrarian)
         if i < max(cfg.bb_len, cfg.rsi_len):
+            continue
+
+        # Skip opening new baskets on the final bar since we cannot execute next-bar fills
+        if i >= len(df) - 1:
             continue
 
         # Long entry
@@ -838,6 +863,66 @@ def run_best_and_export(df: pd.DataFrame, best_cfg_dict: Dict[str, Any], out_dir
 
     return res
 
+def run_full_workflow_for_interval(
+    symbol: str,
+    category: str,
+    interval: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    base_cfg: Config,
+    n_trials: int,
+    keep_top: int,
+    budget_frac: float,
+    seed: Optional[int],
+    out_root: str = "results",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    print(f"\n=== Interval {interval}m ===")
+    if base_cfg.leverage > 1.0 and str(category).lower() == "spot":
+        raise ValueError("Leverage > 1 requires a derivative category (linear or inverse), not spot.")
+
+    df = load_or_fetch_ohlcv(symbol, category, interval, start, end)
+    print(f"Data rows: {len(df)}  |  {symbol} {category} {interval}  |  {start} -> {end}")
+    print(f"Running optimizer: trials={n_trials}, keep_top={keep_top}, margin_budget={budget_frac*100:.0f}%")
+
+    best = run_optimizer(
+        df=df,
+        base_cfg=base_cfg,
+        n_trials=n_trials,
+        budget_frac=budget_frac,
+        keep_top=keep_top,
+        seed=seed,
+    )
+
+    if not best:
+        raise RuntimeError(f"No valid results produced for interval {interval}. Try fewer constraints or check data.")
+
+    out_dir = os.path.join(out_root, f"{symbol}_{interval}m")
+    save_best_outputs(best, out_dir=out_dir)
+
+    # Print top 5 to console
+    print("\nTOP 5 RESULTS:")
+    for i, b in enumerate(best[:5], start=1):
+        c = b["config"]
+        print(
+            f"{i}) score={b['score']:.2f} final_eq={b['final_equity']:.2f} "
+            f"dd={b['max_drawdown_pct']*100:.2f}% trades={b['num_trades']} win={b['win_rate']*100:.1f}% "
+            f"tp={c['basket_tp_pct']:.4f} step={c['add_step_pct']:.4f} mult={c['size_mult']:.2f} "
+            f"adds={c['max_adds']} base={c['base_margin_frac']:.4f} add={c['add_margin_frac']:.4f} "
+            f"bb=({c['bb_len']},{c['bb_stdev']:.2f}) rsi=({c['rsi_len']},{c['rsi_oversold']:.1f}/{c['rsi_overbought']:.1f}) "
+            f"sides={'LS' if (c['enable_long'] and c['enable_short']) else ('L' if c['enable_long'] else 'S')}"
+        )
+
+    best_cfg_dict = best[0]["config"]
+    best_res = run_best_and_export(df, best_cfg_dict, out_dir=out_dir)
+
+    print("\nBEST CONFIG RUN (exported equity_curve_best.csv + trades_best.csv):")
+    print("Final equity:", round(best_res["final_equity"], 2))
+    print("Total PnL:", round(best_res["total_pnl"], 2), f"({best_res['total_pnl_pct']*100:.2f}%)")
+    print("Trades:", best_res["num_trades"], "Win rate:", f"{best_res['win_rate']*100:.2f}%")
+    print("Max DD:", f"{best_res['max_drawdown_pct']*100:.2f}%")
+
+    return best, best_res
+
 if __name__ == "__main__":
     # -----------------------------
     # Base / Defaults
@@ -864,13 +949,11 @@ if __name__ == "__main__":
     # -----------------------------
     symbol = "SOLUSDT"
     category = "linear"   # USDT perps
-    interval = "5"        # 5m candles
+    intervals = ["1", "3", "5", "15"]  # run multiple granularities
 
     # last 90 days window
     end = pd.Timestamp.utcnow()
     start = end - pd.Timedelta(days=90)
-
-    df = load_or_fetch_ohlcv(symbol, category, interval, start, end)
 
     # -----------------------------
     # Optimizer Settings
@@ -880,51 +963,21 @@ if __name__ == "__main__":
     BUDGET_FRAC = 0.95
     SEED = 1337
 
-    print(f"Data rows: {len(df)}  |  {symbol} {category} {interval}  |  {start} -> {end}")
-    print(f"Running optimizer: trials={N_TRIALS}, keep_top={KEEP_TOP}, margin_budget={BUDGET_FRAC*100:.0f}%")
 
-    best = run_optimizer(
-        df=df,
-        base_cfg=base_cfg,
-        n_trials=N_TRIALS,
-        budget_frac=BUDGET_FRAC,
-        keep_top=KEEP_TOP,
-        seed=SEED,
-    )
-
-    if not best:
-        raise RuntimeError("No valid results produced. Try fewer constraints or check data.")
-
-    # Save summary outputs
-    save_best_outputs(best, out_dir=".")
-
-    # Print top 5 to console
-    print("\nTOP 5 RESULTS:")
-    for i, b in enumerate(best[:5], start=1):
-        c = b["config"]
-        print(
-            f"{i}) score={b['score']:.2f} final_eq={b['final_equity']:.2f} "
-            f"dd={b['max_drawdown_pct']*100:.2f}% trades={b['num_trades']} win={b['win_rate']*100:.1f}% "
-            f"tp={c['basket_tp_pct']:.4f} step={c['add_step_pct']:.4f} mult={c['size_mult']:.2f} "
-            f"adds={c['max_adds']} base={c['base_margin_frac']:.4f} add={c['add_margin_frac']:.4f} "
-            f"bb=({c['bb_len']},{c['bb_stdev']:.2f}) rsi=({c['rsi_len']},{c['rsi_oversold']:.1f}/{c['rsi_overbought']:.1f}) "
-            f"sides={'LS' if (c['enable_long'] and c['enable_short']) else ('L' if c['enable_long'] else 'S')}"
+    # Run workflow for each interval, keeping outputs separate
+    for interval in intervals:
+        run_full_workflow_for_interval(
+            symbol=symbol,
+            category=category,
+            interval=interval,
+            start=start,
+            end=end,
+            base_cfg=base_cfg,
+            n_trials=N_TRIALS,
+            keep_top=KEEP_TOP,
+            budget_frac=BUDGET_FRAC,
+            seed=SEED,
+            out_root="results",
         )
-
-    # Run best config and export detailed files
-    best_cfg_dict = best[0]["config"]
-    best_res = run_best_and_export(df, best_cfg_dict, out_dir=".")
-
-    print("\nBEST CONFIG RUN (exported equity_curve_best.csv + trades_best.csv):")
-    print("Final equity:", round(best_res["final_equity"], 2))
-    print("Total PnL:", round(best_res["total_pnl"], 2), f"({best_res['total_pnl_pct']*100:.2f}%)")
-    print("Trades:", best_res["num_trades"], "Win rate:", f"{best_res['win_rate']*100:.2f}%")
-    print("Max DD:", f"{best_res['max_drawdown_pct']*100:.2f}%")
-
-    print("\nSaved:")
-    print("- best_results.csv")
-    print("- best_config.json")
-    print("- equity_curve_best.csv")
-    print("- trades_best.csv")
 
 # ---- chunk 4 ends here ----
