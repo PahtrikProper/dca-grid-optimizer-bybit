@@ -60,7 +60,12 @@ BYBIT_BASE = "https://api.bybit.com"
 
 
 def _to_ms(ts: pd.Timestamp) -> int:
-    return int(pd.Timestamp(ts, tz="UTC").value // 1_000_000)
+    ts_val = pd.Timestamp(ts)
+    if ts_val.tzinfo is None:
+        ts_val = ts_val.tz_localize("UTC")
+    else:
+        ts_val = ts_val.tz_convert("UTC")
+    return int(ts_val.value // 1_000_000)
 
 
 def bybit_get_klines(
