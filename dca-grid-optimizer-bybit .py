@@ -294,7 +294,7 @@ def run_backtest(
     if end_time is None:
         end_time = pd.Timestamp("2027-01-01", tz="UTC")
 
-    in_date = (df.index >= start_time) & (df.index <= end_time)
+    in_date = np.asarray((df.index >= start_time) & (df.index <= end_time))
     levels = compute_grid_levels(df)
 
     entry_conditions = levels["entry_conditions"]
@@ -340,7 +340,7 @@ def run_backtest(
         if position_qty != 0.0:
             tp_price = entry_price * (1 - tp_pct)
             hit_tp = price_low <= tp_price
-            hit_exit = bool(exit_signal.iloc[i] and in_date.iloc[i])
+            hit_exit = bool(exit_signal.iloc[i] and in_date[i])
 
             exit_px = None
             reason = None
@@ -376,7 +376,7 @@ def run_backtest(
             continue
 
         # flat: look for entry
-        if not in_date.iloc[i]:
+        if not in_date[i]:
             continue
         if entry_signal.iloc[i] != 0:
             exec_price = price_close * (1 - slip)  # selling to open short, slip worsens price slightly
