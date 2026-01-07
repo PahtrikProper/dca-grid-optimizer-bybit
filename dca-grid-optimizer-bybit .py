@@ -242,25 +242,43 @@ class BacktestResult:
     equity_curve: pd.DataFrame
 
 
+@dataclass
+class OptimizerResult:
+    score: float
+    final_equity: float
+    total_pnl: float
+    win_rate: float
+    num_trades: int
+    band_mult: float
+    tp_pct: float
+    ma_len: int
+    ema_len: int
+
+
 # =============================
 # Strategy Computation
 # =============================
 
 
-def compute_grid_levels(df: pd.DataFrame, band_mult: float = 2.5) -> Dict[str, List[pd.Series]]:
+def compute_grid_levels(
+    df: pd.DataFrame,
+    band_mult: float = 2.5,
+    ma_len: int = 100,
+    ema_len: int = 5,
+) -> Dict[str, List[pd.Series]]:
     close = df["close"]
     high = df["high"]
     low = df["low"]
 
-    main_rma = rma(close, 100)
+    main_rma = rma(close, ma_len)
 
     premium_zones = []
     discount_zones = []
     for k in range(1, 9):
         factor_up = 1 + band_mult * 0.01 * k  # band_mult percent per level
         factor_dn = 1 - band_mult * 0.01 * k
-        premium_zones.append(ema(main_rma * factor_up, 5))
-        discount_zones.append(ema(main_rma * factor_dn, 5))
+        premium_zones.append(ema(main_rma * factor_up, ema_len))
+        discount_zones.append(ema(main_rma * factor_dn, ema_len))
 
     cover_main = ema(main_rma, 1)  # same as main_rma but kept for uniformity
 
@@ -285,6 +303,10 @@ def run_backtest(
     initial_equity: float = 1000.0,
     start_time: Optional[pd.Timestamp] = None,
     end_time: Optional[pd.Timestamp] = None,
+    band_mult: float = 2.5,
+    tp_pct: float = 0.01,
+    ma_len: int = 100,
+    ema_len: int = 5,
 ) -> BacktestResult:
     """
     Executes the short-only 5m strategy with fixed 1% TP and fallback exits.
@@ -295,7 +317,7 @@ def run_backtest(
         end_time = pd.Timestamp("2027-01-01", tz="UTC")
 
     in_date = np.asarray((df.index >= start_time) & (df.index <= end_time))
-    levels = compute_grid_levels(df)
+    levels = compute_grid_levels(df, band_mult=band_mult, ma_len=ma_len, ema_len=ema_len)
 
     entry_conditions = levels["entry_conditions"]
     exit_conditions = levels["exit_conditions"]
@@ -320,7 +342,6 @@ def run_backtest(
     position_qty = 0.0
     entry_price = 0.0
     entry_fee = 0.0
-    tp_pct = 0.01
     slip = slippage_bps / 1e4
 
     for i in range(1, len(df)):
@@ -429,6 +450,72 @@ def run_backtest(
     )
 
 
+def score_result(result: BacktestResult) -> float:
+    drawdown = 0.0
+    if not result.equity_curve.empty:
+        curve = result.equity_curve["equity"]
+        peak = curve.cummax()
+        dd = (curve - peak) / peak.replace(0, np.nan)
+        drawdown = float(dd.min()) * -1.0
+    dd_penalty = 1.25 * drawdown
+    return result.final_equity * (1.0 - dd_penalty)
+
+
+def run_optimizer(
+    df: pd.DataFrame,
+    trials: int,
+    commission_rate: float,
+    slippage_bps: float,
+    initial_equity: float,
+    start_time: pd.Timestamp,
+    end_time: pd.Timestamp,
+    band_mult_range: tuple[float, float],
+    tp_pct_range: tuple[float, float],
+    ma_len: int,
+    ema_len: int,
+    seed: Optional[int],
+) -> List[OptimizerResult]:
+    rng = np.random.default_rng(seed)
+    results: List[OptimizerResult] = []
+    for idx in range(1, trials + 1):
+        band_mult = float(rng.uniform(band_mult_range[0], band_mult_range[1]))
+        tp_pct = float(rng.uniform(tp_pct_range[0], tp_pct_range[1]))
+        res = run_backtest(
+            df=df,
+            commission_rate=commission_rate,
+            slippage_bps=slippage_bps,
+            initial_equity=initial_equity,
+            start_time=start_time,
+            end_time=end_time,
+            band_mult=band_mult,
+            tp_pct=tp_pct,
+            ma_len=ma_len,
+            ema_len=ema_len,
+        )
+        score = score_result(res)
+        results.append(
+            OptimizerResult(
+                score=score,
+                final_equity=res.final_equity,
+                total_pnl=res.total_pnl,
+                win_rate=res.win_rate,
+                num_trades=res.num_trades,
+                band_mult=band_mult,
+                tp_pct=tp_pct,
+                ma_len=ma_len,
+                ema_len=ema_len,
+            )
+        )
+        if idx % 100 == 0:
+            top = max(results, key=lambda r: r.score)
+            print(
+                f"[{idx}/{trials}] best score={top.score:.2f} final_eq={top.final_equity:.2f} "
+                f"tp={top.tp_pct:.4f} band_mult={top.band_mult:.2f}"
+            )
+    results.sort(key=lambda r: r.score, reverse=True)
+    return results
+
+
 # =============================
 # CLI
 # =============================
@@ -444,6 +531,17 @@ def main() -> None:
     parser.add_argument("--commission-rate", type=float, default=0.0001, help="Commission rate (percent=0.01% default).")
     parser.add_argument("--slippage-bps", type=float, default=0.0, help="Slippage in basis points (per side).")
     parser.add_argument("--cache-dir", default="./bybit_cache", help="Cache directory for OHLCV CSVs.")
+    parser.add_argument("--band-mult", type=float, default=2.5, help="Band multiplier percent for grid levels.")
+    parser.add_argument("--tp-pct", type=float, default=0.01, help="Take-profit percent (e.g., 0.01 = 1%).")
+    parser.add_argument("--ma-len", type=int, default=100, help="RMA length for main trend.")
+    parser.add_argument("--ema-len", type=int, default=5, help="EMA length for grid smoothing.")
+    parser.add_argument("--optimize", action="store_true", help="Run random optimizer over band/TP.")
+    parser.add_argument("--trials", type=int, default=1000, help="Optimizer trials.")
+    parser.add_argument("--band-mult-min", type=float, default=1.0, help="Optimizer band multiplier min.")
+    parser.add_argument("--band-mult-max", type=float, default=4.0, help="Optimizer band multiplier max.")
+    parser.add_argument("--tp-min", type=float, default=0.005, help="Optimizer TP min.")
+    parser.add_argument("--tp-max", type=float, default=0.02, help="Optimizer TP max.")
+    parser.add_argument("--seed", type=int, default=1337, help="Optimizer random seed.")
     args = parser.parse_args()
 
     interval = "5"
@@ -463,6 +561,36 @@ def main() -> None:
     )
     print(f"Data rows: {len(df)}  |  {args.symbol} {args.category} {interval}m  |  {df.index.min()} -> {df.index.max()}")
 
+    if args.optimize:
+        results = run_optimizer(
+            df=df,
+            trials=int(args.trials),
+            commission_rate=float(args.commission_rate),
+            slippage_bps=float(args.slippage_bps),
+            initial_equity=float(args.initial_equity),
+            start_time=start_ts,
+            end_time=end_ts,
+            band_mult_range=(float(args.band_mult_min), float(args.band_mult_max)),
+            tp_pct_range=(float(args.tp_min), float(args.tp_max)),
+            ma_len=int(args.ma_len),
+            ema_len=int(args.ema_len),
+            seed=int(args.seed) if args.seed is not None else None,
+        )
+        top = results[0]
+        print("\n=== Optimizer Top Result ===")
+        print(f"Score: {top.score:.2f}")
+        print(f"Final equity: {top.final_equity:.2f}")
+        print(f"Total PnL: {top.total_pnl:.2f}")
+        print(f"Win rate: {top.win_rate*100:.2f}%")
+        print(f"Trades: {top.num_trades}")
+        print(f"Band mult: {top.band_mult:.2f}")
+        print(f"TP pct: {top.tp_pct:.4f}")
+
+        os.makedirs("results", exist_ok=True)
+        pd.DataFrame([asdict(r) for r in results]).to_csv("results/optimizer_results.csv", index=False)
+        print("Saved results/optimizer_results.csv")
+        return
+
     res = run_backtest(
         df=df,
         commission_rate=float(args.commission_rate),
@@ -470,6 +598,10 @@ def main() -> None:
         initial_equity=float(args.initial_equity),
         start_time=start_ts,
         end_time=end_ts,
+        band_mult=float(args.band_mult),
+        tp_pct=float(args.tp_pct),
+        ma_len=int(args.ma_len),
+        ema_len=int(args.ema_len),
     )
 
     print("\n=== Backtest Results ===")
