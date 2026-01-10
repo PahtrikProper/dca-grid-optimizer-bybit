@@ -167,7 +167,15 @@ def rest_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = BASE_REST + path
     _rate_limit_rest()
     r = requests.get(url, params=params, timeout=30)
-    j = r.json()
+    try:
+        j = r.json()
+    except ValueError as exc:
+        log.error(
+            "Bybit REST non-JSON response status=%s body=%s",
+            r.status_code,
+            r.text
+        )
+        raise RuntimeError("Bybit REST returned non-JSON response.") from exc
     if "retCode" not in j:
         raise RuntimeError(f"Bybit REST unexpected response: {j}")
     if j["retCode"] != 0:
