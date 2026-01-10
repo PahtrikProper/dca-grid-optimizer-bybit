@@ -1450,6 +1450,7 @@ class LiveRealTrader:
         self.instrument = self.client.get_instrument_info(SYMBOL)
 
         self.wallet = float(self.client.get_wallet_balance())
+        self.initial_wallet = self.wallet
         self.position: Optional[RealPosition] = self.client.get_position(SYMBOL)
 
         self.df = df_last_seed[["ts","open","high","low","close"]].copy().reset_index(drop=True)
@@ -1705,9 +1706,12 @@ class LiveRealTrader:
 
         if self.position is None:
             if PRINT_EVERY_CANDLE:
-                pnl_usdt = self.wallet - float(STARTING_WALLET)
-                pnl_pct = (pnl_usdt / float(STARTING_WALLET)) * 100.0 if STARTING_WALLET else 0.0
-                log.info(f"[{ts_utc}] FLAT close={c:.8f} mark={self.mark_price:.8f} wallet={self.wallet:.2f} pnl={pnl_usdt:.2f} ({pnl_pct:.2f}%)")
+                pnl_usdt = self.wallet - float(self.initial_wallet)
+                pnl_pct = (pnl_usdt / float(self.initial_wallet)) * 100.0 if self.initial_wallet else 0.0
+                log.info(
+                    f"[{ts_utc}] FLAT close={c:.8f} mark={self.mark_price:.8f} "
+                    f"wallet={self.wallet:.2f} pnl={pnl_usdt:.2f} ({pnl_pct:.2f}%)"
+                )
             return
 
         pos = self.position
@@ -1932,8 +1936,9 @@ def main():
         start_live_ws(trader)
     except KeyboardInterrupt:
         # summary on stop
-        pnl_usdt = trader.wallet - float(STARTING_WALLET)
-        pnl_pct = (pnl_usdt / float(STARTING_WALLET)) * 100.0 if STARTING_WALLET else 0.0
+        baseline_wallet = getattr(trader, "initial_wallet", float(STARTING_WALLET))
+        pnl_usdt = trader.wallet - float(baseline_wallet)
+        pnl_pct = (pnl_usdt / float(baseline_wallet)) * 100.0 if baseline_wallet else 0.0
         wr = (trader.win_count / trader.trade_count * 100.0) if trader.trade_count else 0.0
 
         log.info("\nStopped by user.")
