@@ -32,6 +32,7 @@ CATEGORY = "linear"
 DAYS_BACK_SEED = 7             # initial history window
 STARTING_WALLET = 500.0
 LEVERAGE = 10.0
+USE_FRACTION = 0.95
 
 # TradingView commission_value=0.01 => 0.01% = 0.0001
 FEE_RATE = 0.0001              # per side, on notional
@@ -1243,7 +1244,7 @@ class LivePaperTrader:
             wallet_before = self.wallet
             fill = apply_slippage(c, "sell")
 
-            margin = self.wallet
+            margin = self.wallet * float(USE_FRACTION)
             notional = margin * float(LEVERAGE)
             qty = notional / fill
 
@@ -1712,7 +1713,7 @@ class LiveRealTrader:
         if entry_signal != 0 and self.position is None:
             wallet_before = self.wallet
             try:
-                qty = self._format_qty((self.wallet * float(LEVERAGE)) / c)
+                qty = self._format_qty((self.wallet * float(USE_FRACTION) * float(LEVERAGE)) / c)
                 self._ensure_entry_risk_checks(qty, c, wallet_before)
                 order_id = self.client.place_market_order(SYMBOL, "Sell", qty, reduce_only=False)
                 self._refresh_state()
