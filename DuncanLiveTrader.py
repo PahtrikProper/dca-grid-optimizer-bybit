@@ -782,7 +782,18 @@ class BybitPrivateClient:
         coins = rows[0].get("coin", [])
         for coin in coins:
             if coin.get("coin") == "USDT":
-                return float(coin.get("availableToWithdraw", coin.get("walletBalance")))
+                available = coin.get("availableToWithdraw")
+                balance = coin.get("walletBalance")
+                for value in (available, balance):
+                    if value is None:
+                        continue
+                    if isinstance(value, str) and not value.strip():
+                        continue
+                    try:
+                        return float(value)
+                    except Exception:
+                        continue
+                raise RuntimeError("USDT wallet balance value was empty or invalid")
         raise RuntimeError("USDT wallet balance not found")
 
     def get_position(self, symbol: str) -> Optional[RealPosition]:
