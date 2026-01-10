@@ -232,7 +232,15 @@ def rest_request(
         _rate_limit_rest()
         r = requests.post(full_url, headers=headers, data=data, timeout=30)
 
-    j = r.json()
+    try:
+        j = r.json()
+    except ValueError as exc:
+        log.error(
+            "Bybit REST non-JSON response status=%s body=%s",
+            r.status_code,
+            r.text
+        )
+        raise RuntimeError("Bybit REST returned non-JSON response.") from exc
     if "retCode" not in j:
         log.error("Bybit REST unexpected response: %s", j)
         raise RuntimeError(f"Bybit REST unexpected response: {j}")
