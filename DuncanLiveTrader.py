@@ -1653,6 +1653,8 @@ class LiveRealTrader:
         self._maybe_run_wfo()
         self._maybe_apply_pending_params()
 
+        self._refresh_state()
+
         if not self._is_candle_fresh(ts):
             log.warning(f"[{ts_utc}] Skipping stale candle (older than {CANDLE_STALENESS_MAX_SEC}s).")
             return
@@ -1676,8 +1678,6 @@ class LiveRealTrader:
                 break
         if crossunder(float(prev["low"]), l, float(prev["main"]), float(row["main"])):
             exit_signal = True
-
-        self._refresh_state()
 
         if entry_signal != 0 and self.position is None:
             wallet_before = self.wallet
@@ -1875,6 +1875,15 @@ def main():
     if INTERVAL != "5":
         raise RuntimeError("This script is hard-coded to 5m candles only (INTERVAL must be '5').")
 
+    client = None
+    if REAL_TRADING_ENABLED:
+        if not API_KEY or not API_SECRET:
+            raise RuntimeError("REAL_TRADING_ENABLED requires BYBIT_API_KEY and BYBIT_API_SECRET.")
+        client = BybitPrivateClient()
+        live_wallet = float(client.get_wallet_balance())
+        globals()["STARTING_WALLET"] = live_wallet
+        log.info(f"Using live wallet balance for backtest baseline: {live_wallet:.2f} USDT")
+
     # 1) Download seed history so indicators are warmed up
     df_last, df_mark = download_seed_history(DAYS_BACK_SEED)
 
@@ -1911,9 +1920,8 @@ def main():
     )
 
     if REAL_TRADING_ENABLED:
-        if not API_KEY or not API_SECRET:
-            raise RuntimeError("REAL_TRADING_ENABLED requires BYBIT_API_KEY and BYBIT_API_SECRET.")
-        client = BybitPrivateClient()
+        if client is None:
+            client = BybitPrivateClient()
         client.ensure_futures_setup(SYMBOL)
         trader = LiveRealTrader(
             df_last_seed=df_last,
