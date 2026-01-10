@@ -738,18 +738,34 @@ class BybitPrivateClient:
             for coin in row.get("coin", []):
                 if coin.get("coin") != "USDT":
                     continue
-                available = coin.get("availableToWithdraw")
-                balance = coin.get("availableBalance")
-                for value in (available, balance):
-                    if value is None or (isinstance(value, str) and not value.strip()):
-                        continue
+                log.info("USDT wallet object: %s", coin)
+                available_withdraw = coin.get("availableToWithdraw")
+                available_balance = coin.get("availableBalance")
+                wallet_balance = coin.get("walletBalance")
+
+                def _parse_value(value: Any) -> Optional[float]:
+                    if value is None:
+                        return None
+                    if isinstance(value, str) and not value.strip():
+                        return None
                     try:
                         return float(value)
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"USDT available balance invalid for accountType=UNIFIED: {value}"
-                        ) from exc
-                raise RuntimeError("USDT available balance missing for accountType=UNIFIED")
+                    except Exception:
+                        return None
+
+                parsed_available_withdraw = _parse_value(available_withdraw)
+                if parsed_available_withdraw is not None and parsed_available_withdraw > 0:
+                    return parsed_available_withdraw
+
+                parsed_available_balance = _parse_value(available_balance)
+                if parsed_available_balance is not None and parsed_available_balance > 0:
+                    return parsed_available_balance
+
+                parsed_wallet_balance = _parse_value(wallet_balance)
+                if parsed_wallet_balance is not None:
+                    return parsed_wallet_balance
+
+                raise RuntimeError("No usable USDT balance fields returned by Bybit")
         raise RuntimeError("USDT balance not found for accountType=UNIFIED")
 
     def set_position_mode(self, symbol: str, mode: int = 0):
