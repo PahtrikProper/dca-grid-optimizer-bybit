@@ -26,7 +26,7 @@ from websocket import WebSocketApp
 # ============================================================
 # USER SETTINGS
 # ============================================================
-SYMBOLS = ["WHALEUSDT", "HYPEUSDT", "JASMYUSDT"]
+SYMBOLS = ["WHITEWHALEUSDT", "HYPEUSDT", "SOLUSDT"]
 INTERVAL = "5"                 # HARD CODED 5m
 CATEGORY = "linear"
 
@@ -66,8 +66,7 @@ PRINT_EVERY_CANDLE = True
 API_POLITE_SLEEP = 0.1
 REST_MIN_INTERVAL_SEC = 0.2
 
-# Live trading toggles (real orders)
-REAL_TRADING_ENABLED = False
+# Live trading settings (real orders)
 API_KEY = "YOUR_BYBIT_API_KEY"
 API_SECRET = "YOUR_BYBIT_API_SECRET"
 RECV_WINDOW = "5000"
@@ -227,8 +226,16 @@ def rest_request(
 
     j = r.json()
     if "retCode" not in j:
+        log.error("Bybit REST unexpected response: %s", j)
         raise RuntimeError(f"Bybit REST unexpected response: {j}")
     if j["retCode"] != 0:
+        log.error(
+            "Bybit REST error retCode=%s retMsg=%s params=%s body=%s",
+            j.get("retCode"),
+            j.get("retMsg"),
+            params,
+            body
+        )
         raise RuntimeError(f"Bybit REST error retCode={j['retCode']} retMsg={j.get('retMsg')} params={params} body={body}")
     return j
 
@@ -998,6 +1005,21 @@ class BybitPrivateClient:
         )
         return j["result"]["orderId"]
 
+    def get_order_status(self, symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
+        j = rest_request(
+            "GET",
+            "/v5/order/history",
+            params={
+                "category": CATEGORY,
+                "symbol": symbol,
+                "orderId": order_id,
+                "limit": 1
+            },
+            auth=True
+        )
+        rows = j["result"].get("list", [])
+        return rows[0] if rows else None
+
     def get_instrument_info(self, symbol: str) -> Dict[str, Any]:
         j = rest_get("/v5/market/instruments-info", {
             "category": CATEGORY,
@@ -1060,6 +1082,20 @@ class BybitPrivateClient:
                         "qty": total_qty
                     }
             time.sleep(poll_interval)
+        order = self.get_order_status(symbol, order_id)
+        if order:
+            status = order.get("orderStatus")
+            filled = float(order.get("cumExecQty", 0) or 0)
+            avg = float(order.get("avgPrice", 0) or 0)
+            log.warning(
+                "Order %s status=%s cumExecQty=%s avgPrice=%s",
+                order_id,
+                status,
+                filled,
+                avg
+            )
+            if filled > 0 and avg > 0:
+                return {"avg_price": avg, "qty": filled}
         return None
 
 class LivePaperTrader:
@@ -1102,6 +1138,8 @@ class LivePaperTrader:
         self.win_count = 0
         self.realized_pnl_10x_net = 0.0
         self.realized_pnl_1x_gross = 0.0
+        self.account_pnl_usdt = 0.0
+        self.account_pnl_pct = 0.0
 
         self._recompute_indicators()
 
@@ -1701,6 +1739,11 @@ class LiveRealTrader:
     def _refresh_state(self):
         self.wallet = float(self.client.get_unified_usdt())
         self.position = self.client.get_position(self.symbol)
+        self.account_pnl_usdt = self.wallet - float(self.initial_wallet)
+        self.account_pnl_pct = (
+            (self.account_pnl_usdt / float(self.initial_wallet)) * 100.0
+            if self.initial_wallet else 0.0
+        )
 
     def _format_qty(self, raw_qty: float) -> float:
         lot_filter = self.instrument.get("lotSizeFilter", {})
@@ -1878,8 +1921,12 @@ class LiveRealTrader:
                 order_id = self.client.place_market_order(self.symbol, "Sell", qty, reduce_only=False)
                 self._refresh_state()
                 summary = self.client.get_execution_summary(self.symbol, order_id)
-                fill_price = summary["avg_price"] if summary else fetch_last_price(self.symbol)
-                filled_qty = summary["qty"] if summary else qty
+                if summary is None:
+                    log.error(f"[{ts_utc}] Entry order {order_id} has no execution summary; skipping log.")
+                    self.gate.release(self.symbol)
+                    return
+                fill_price = summary["avg_price"]
+                filled_qty = summary["qty"]
                 self._log_real_trade(
                     ts_utc=ts_utc,
                     action="ENTRY",
@@ -1900,8 +1947,8 @@ class LiveRealTrader:
 
         if self.position is None:
             if PRINT_EVERY_CANDLE:
-                pnl_usdt = self.wallet - float(self.initial_wallet)
-                pnl_pct = (pnl_usdt / float(self.initial_wallet)) * 100.0 if self.initial_wallet else 0.0
+                pnl_usdt = self.account_pnl_usdt
+                pnl_pct = self.account_pnl_pct
                 log.info(
                     f"[{ts_utc}] FLAT close={c:.8f} mark={self.mark_price:.8f} "
                     f"wallet={self.wallet:.2f} pnl={pnl_usdt:.2f} ({pnl_pct:.2f}%)"
@@ -1920,8 +1967,11 @@ class LiveRealTrader:
                 order_id = self.client.place_market_order(self.symbol, "Buy", qty_to_close, reduce_only=True)
                 self._refresh_state()
                 summary = self.client.get_execution_summary(self.symbol, order_id)
-                fill_price = summary["avg_price"] if summary else fetch_last_price(self.symbol)
-                filled_qty = summary["qty"] if summary else qty_to_close
+                if summary is None:
+                    log.error(f"[{ts_utc}] Exit order {order_id} has no execution summary; skipping log.")
+                    return
+                fill_price = summary["avg_price"]
+                filled_qty = summary["qty"]
                 reason = "TP" if l <= tp_price else "MEAN_REVERSION"
                 self._log_real_trade(
                     ts_utc=ts_utc,
@@ -2131,29 +2181,19 @@ def main():
             tp_perc=float(best_params["tp_perc"])
         )
 
-        if REAL_TRADING_ENABLED:
-            if client is None:
-                client = BybitPrivateClient()
-            client.ensure_futures_setup(symbol)
-            trader = LiveRealTrader(
-                symbol=symbol,
-                df_last_seed=df_last,
-                df_mark_seed=df_mark,
-                risk_df=risk_df,
-                params=params,
-                client=client,
-                gate=gate
-            )
-            log.info(f"REAL TRADING ENABLED: sending live orders to Bybit for {symbol}.")
-        else:
-            trader = LivePaperTrader(
-                symbol=symbol,
-                df_last_seed=df_last,
-                df_mark_seed=df_mark,
-                risk_df=risk_df,
-                params=params,
-                gate=gate
-            )
+        if client is None:
+            client = BybitPrivateClient()
+        client.ensure_futures_setup(symbol)
+        trader = LiveRealTrader(
+            symbol=symbol,
+            df_last_seed=df_last,
+            df_mark_seed=df_mark,
+            risk_df=risk_df,
+            params=params,
+            client=client,
+            gate=gate
+        )
+        log.info(f"REAL TRADING ENABLED: sending live orders to Bybit for {symbol}.")
         traders[symbol] = trader
 
     # 5) Live WS (auto reconnect)
