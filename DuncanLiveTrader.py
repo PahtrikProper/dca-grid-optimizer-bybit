@@ -1910,14 +1910,12 @@ def main():
         raise RuntimeError("Live wallet usage requires BYBIT_API_KEY and BYBIT_API_SECRET.")
     client = BybitPrivateClient()
     unified_balance = float(client.get_unified_usdt())
-    required_amount = float(STARTING_WALLET)
+    required_amount = unified_balance
     log.info(f"Unified available USDT balance: {unified_balance:.2f}")
     log.info(f"Required margin (USDT): {required_amount:.2f}")
 
-    if unified_balance < required_amount:
-        raise RuntimeError(
-            f"Insufficient unified balance: {unified_balance:.2f} < required {required_amount:.2f}"
-        )
+    if unified_balance <= 0:
+        raise RuntimeError("Unified available balance is zero; cannot proceed with trading.")
 
     globals()["STARTING_WALLET"] = unified_balance
     log.info(f"Using live wallet balance for backtest baseline: {unified_balance:.2f} USDT")
