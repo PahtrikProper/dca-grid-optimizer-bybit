@@ -28,7 +28,6 @@ from websocket import WebSocketApp
 SYMBOL = "HYPEUSDT"
 INTERVAL = "5"                 # HARD CODED 5m
 CATEGORY = "linear"
-ACCOUNT_TYPE = "FUND"
 
 DAYS_BACK_SEED = 7             # initial history window
 STARTING_WALLET = 500.0
@@ -725,6 +724,73 @@ class RealPosition:
     side: str
 
 class BybitPrivateClient:
+    def _get_wallet_usdt(self, account_type: str) -> float:
+        j = rest_request(
+            "GET",
+            "/v5/account/wallet-balance",
+            params={"accountType": account_type},
+            auth=True
+        )
+        rows = j["result"].get("list", [])
+        if not rows:
+            raise RuntimeError(f"No wallet balance returned for accountType={account_type}")
+        for row in rows:
+            for coin in row.get("coin", []):
+                if coin.get("coin") != "USDT":
+                    continue
+                available = coin.get("availableToWithdraw")
+                if available is None or (isinstance(available, str) and not available.strip()):
+                    raise RuntimeError(f"USDT availableToWithdraw missing for accountType={account_type}")
+                try:
+                    return float(available)
+                except Exception as exc:
+                    raise RuntimeError(f"USDT availableToWithdraw invalid for accountType={account_type}: {available}") from exc
+        raise RuntimeError(f"USDT balance not found for accountType={account_type}")
+
+    def get_funding_usdt(self) -> float:
+        return self._get_wallet_usdt("FUND")
+
+    def get_unified_usdt(self) -> float:
+        return self._get_wallet_usdt("UNIFIED")
+
+    def ensure_unified_margin(self, required_amount: float) -> None:
+        funding = self.get_funding_usdt()
+        unified = self.get_unified_usdt()
+        log.info(f"Funding wallet USDT balance: {funding:.2f}")
+        log.info(f"Unified wallet USDT balance: {unified:.2f}")
+
+        if unified >= required_amount:
+            log.info("Unified wallet has sufficient balance for trading.")
+            return
+
+        transfer_amount = required_amount - unified
+        if transfer_amount <= 0:
+            return
+        if funding < transfer_amount:
+            raise RuntimeError(
+                f"Insufficient funding balance for transfer: funding={funding:.2f}, required={transfer_amount:.2f}"
+            )
+
+        log.info(f"Transferring {transfer_amount:.2f} USDT from FUND to UNIFIED.")
+        rest_request(
+            "POST",
+            "/v5/asset/transfer/inter-transfer",
+            body={
+                "fromAccountType": "FUND",
+                "toAccountType": "UNIFIED",
+                "coin": "USDT",
+                "amount": f"{transfer_amount:.8f}",
+            },
+            auth=True
+        )
+
+        unified_after = self.get_unified_usdt()
+        log.info(f"Unified wallet USDT balance after transfer: {unified_after:.2f}")
+        if unified_after < required_amount:
+            raise RuntimeError(
+                f"Unified balance after transfer still below required amount: {unified_after:.2f} < {required_amount:.2f}"
+            )
+
     def set_position_mode(self, symbol: str, mode: int = 0):
         rest_request(
             "POST",
@@ -770,48 +836,7 @@ class BybitPrivateClient:
         self.set_leverage(symbol, LEVERAGE, LEVERAGE)
 
     def get_wallet_balance(self) -> float:
-        if ACCOUNT_TYPE == "FUND":
-            j = rest_request(
-                "GET",
-                "/v5/asset/transfer/query-account-coins-balance",
-                params={"accountType": "FUND", "coin": "USDT"},
-                auth=True
-            )
-            rows = j["result"].get("balance", [])
-            for row in rows:
-                if row.get("coin") != "USDT":
-                    continue
-                value = row.get("walletBalance")
-                if value is None or (isinstance(value, str) and not value.strip()):
-                    raise RuntimeError("USDT funding wallet balance value was empty or invalid")
-                return float(value)
-            raise RuntimeError("USDT funding wallet balance not found")
-
-        j = rest_request(
-            "GET",
-            "/v5/account/wallet-balance",
-            params={"accountType": ACCOUNT_TYPE},
-            auth=True
-        )
-        rows = j["result"]["list"]
-        if not rows:
-            raise RuntimeError("No wallet balance returned")
-        coins = rows[0].get("coin", [])
-        for coin in coins:
-            if coin.get("coin") == "USDT":
-                available = coin.get("availableToWithdraw")
-                balance = coin.get("walletBalance")
-                for value in (available, balance):
-                    if value is None:
-                        continue
-                    if isinstance(value, str) and not value.strip():
-                        continue
-                    try:
-                        return float(value)
-                    except Exception:
-                        continue
-                raise RuntimeError("USDT wallet balance value was empty or invalid")
-        raise RuntimeError("USDT wallet balance not found")
+        return self.get_unified_usdt()
 
     def get_position(self, symbol: str) -> Optional[RealPosition]:
         j = rest_request(
@@ -1477,7 +1502,7 @@ class LiveRealTrader:
         self.pending_params: Optional[Params] = None
         self.instrument = self.client.get_instrument_info(SYMBOL)
 
-        self.wallet = float(self.client.get_wallet_balance())
+        self.wallet = float(self.client.get_unified_usdt())
         self.initial_wallet = self.wallet
         self.position: Optional[RealPosition] = self.client.get_position(SYMBOL)
 
@@ -1538,7 +1563,7 @@ class LiveRealTrader:
             log.error(f"WFO optimisation failed: {e}")
 
     def _refresh_state(self):
-        self.wallet = float(self.client.get_wallet_balance())
+        self.wallet = float(self.client.get_unified_usdt())
         self.position = self.client.get_position(SYMBOL)
 
     def _format_qty(self, raw_qty: float) -> float:
@@ -1907,12 +1932,20 @@ def main():
     if not API_KEY or not API_SECRET:
         raise RuntimeError("Live wallet usage requires BYBIT_API_KEY and BYBIT_API_SECRET.")
     client = BybitPrivateClient()
-    live_wallet = float(client.get_wallet_balance())
+    funding_balance = float(client.get_funding_usdt())
+    unified_balance = float(client.get_unified_usdt())
+    total_balance = funding_balance + unified_balance
+    log.info(f"Funding wallet USDT balance: {funding_balance:.2f}")
+    log.info(f"Unified wallet USDT balance: {unified_balance:.2f}")
+
+    required_amount = total_balance
+    if REAL_TRADING_ENABLED:
+        client.ensure_unified_margin(required_amount)
+        unified_balance = float(client.get_unified_usdt())
+
+    live_wallet = unified_balance if REAL_TRADING_ENABLED else total_balance
     globals()["STARTING_WALLET"] = live_wallet
-    log.info(
-        f"Using live wallet balance for backtest baseline: {live_wallet:.2f} USDT "
-        f"(accountType={ACCOUNT_TYPE})"
-    )
+    log.info(f"Using live wallet balance for backtest baseline: {live_wallet:.2f} USDT")
 
     # 1) Download seed history so indicators are warmed up
     df_last, df_mark = download_seed_history(DAYS_BACK_SEED)
