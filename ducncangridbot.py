@@ -88,9 +88,14 @@ def csv_append(path, row):
     with open(path, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(row)
 
-# Trade log (full detail added later in Part 3/4)
+# Trade log (full detail)
 ensure_csv(TRADES_CSV_PATH, [
-    "ts_utc","action","price","pnl_10x","pnl_1x","wallet"
+    "ts_utc","action","reason","signal_level","side","qty","fill_price","notional","fee",
+    "entry_price","tp_price","mark_price","liq_price",
+    "wallet_before","wallet_after",
+    "pnl_gross","pnl_net_10x","pnl_1x_usdt","pnl_1x_pct","pnl_10x_pct",
+    "tier","indicators","candle_ohlc",
+    "ma_len","band_mult","tp_perc"
 ])
 
 # Param log
@@ -722,11 +727,45 @@ class LivePaperTrader:
         candle_ohlc: Dict[str, float],
         params: Params,
     ):
-        # This writes a “full” row to TRADES_CSV_PATH from Part 1 header (simple header),
-        # but we also keep a compact line for quick sanity.
-        # If you want ONLY full header version, say so and I’ll standardise it.
+        def encode(value: Any) -> str:
+            try:
+                return json.dumps(value, default=str, separators=(",", ":"))
+            except Exception:
+                return json.dumps(str(value))
+
+        tier_dict = {}
+        try:
+            tier_dict = tier.to_dict()
+        except Exception:
+            tier_dict = {"value": str(tier)}
+
         csv_append(TRADES_CSV_PATH, [
-            ts_utc, action, float(fill_price), float(pnl_net_10x), float(pnl_1x_usdt), float(wallet_after)
+            ts_utc,
+            action,
+            reason,
+            int(signal_level),
+            side,
+            float(qty),
+            float(fill_price),
+            float(notional),
+            float(fee),
+            float(entry_price),
+            float(tp_price),
+            float(mark_price),
+            float(liq_price),
+            float(wallet_before),
+            float(wallet_after),
+            float(pnl_gross),
+            float(pnl_net_10x),
+            float(pnl_1x_usdt),
+            float(pnl_1x_pct),
+            float(pnl_10x_pct),
+            encode(tier_dict),
+            encode(ind),
+            encode(candle_ohlc),
+            int(params.ma_len),
+            float(params.band_mult),
+            float(params.tp_perc),
         ])
 
         # Also log to events.log for immediate visibility
