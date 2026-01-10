@@ -28,7 +28,7 @@ from websocket import WebSocketApp
 SYMBOL = "HYPEUSDT"
 INTERVAL = "5"                 # HARD CODED 5m
 CATEGORY = "linear"
-ACCOUNT_TYPE = "UNIFIED"
+ACCOUNT_TYPE = "CONTRACT"
 
 DAYS_BACK_SEED = 7             # initial history window
 STARTING_WALLET = 500.0
@@ -1892,7 +1892,10 @@ def main():
     client = BybitPrivateClient()
     live_wallet = float(client.get_wallet_balance())
     globals()["STARTING_WALLET"] = live_wallet
-    log.info(f"Using live wallet balance for backtest baseline: {live_wallet:.2f} USDT")
+    log.info(
+        f"Using live wallet balance for backtest baseline: {live_wallet:.2f} USDT "
+        f"(accountType={ACCOUNT_TYPE})"
+    )
 
     # 1) Download seed history so indicators are warmed up
     df_last, df_mark = download_seed_history(DAYS_BACK_SEED)
