@@ -913,16 +913,22 @@ class BybitPrivateClient:
         return unified_after
 
     def set_position_mode(self, symbol: str, mode: int = 0):
-        rest_request(
-            "POST",
-            "/v5/position/switch-mode",
-            body={
-                "category": CATEGORY,
-                "symbol": symbol,
-                "mode": mode
-            },
-            auth=True
-        )
+        try:
+            rest_request(
+                "POST",
+                "/v5/position/switch-mode",
+                body={
+                    "category": CATEGORY,
+                    "symbol": symbol,
+                    "mode": mode
+                },
+                auth=True
+            )
+        except RuntimeError as exc:
+            if "retCode=110025" in str(exc) or "Position mode is not modified" in str(exc):
+                log.info("Position mode already set for %s; skipping.", symbol)
+                return
+            raise
 
     def set_margin_mode(self, symbol: str, trade_mode: int = 1):
         rest_request(
