@@ -782,7 +782,7 @@ class LivePaperTrader:
     def _maybe_apply_pending_params(self):
         if self.pending_params is None:
             return
-        if WFO_APPLY_ONLY_WHEN_FLAT and self.position is not None:
+        if self.position is not None:
             return
 
         self.params = self.pending_params
