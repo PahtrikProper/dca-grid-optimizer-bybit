@@ -66,8 +66,7 @@ PRINT_EVERY_CANDLE = True
 API_POLITE_SLEEP = 0.1
 REST_MIN_INTERVAL_SEC = 0.2
 
-# Live trading toggles (real orders)
-REAL_TRADING_ENABLED = True
+# Live trading settings (real orders)
 API_KEY = "YOUR_BYBIT_API_KEY"
 API_SECRET = "YOUR_BYBIT_API_SECRET"
 RECV_WINDOW = "5000"
@@ -2182,29 +2181,19 @@ def main():
             tp_perc=float(best_params["tp_perc"])
         )
 
-        if REAL_TRADING_ENABLED:
-            if client is None:
-                client = BybitPrivateClient()
-            client.ensure_futures_setup(symbol)
-            trader = LiveRealTrader(
-                symbol=symbol,
-                df_last_seed=df_last,
-                df_mark_seed=df_mark,
-                risk_df=risk_df,
-                params=params,
-                client=client,
-                gate=gate
-            )
-            log.info(f"REAL TRADING ENABLED: sending live orders to Bybit for {symbol}.")
-        else:
-            trader = LivePaperTrader(
-                symbol=symbol,
-                df_last_seed=df_last,
-                df_mark_seed=df_mark,
-                risk_df=risk_df,
-                params=params,
-                gate=gate
-            )
+        if client is None:
+            client = BybitPrivateClient()
+        client.ensure_futures_setup(symbol)
+        trader = LiveRealTrader(
+            symbol=symbol,
+            df_last_seed=df_last,
+            df_mark_seed=df_mark,
+            risk_df=risk_df,
+            params=params,
+            client=client,
+            gate=gate
+        )
+        log.info(f"REAL TRADING ENABLED: sending live orders to Bybit for {symbol}.")
         traders[symbol] = trader
 
     # 5) Live WS (auto reconnect)
