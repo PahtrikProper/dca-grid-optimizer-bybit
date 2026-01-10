@@ -14,6 +14,7 @@ import hashlib
 import urllib.parse
 import math
 import uuid
+import threading
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
@@ -25,7 +26,7 @@ from websocket import WebSocketApp
 # ============================================================
 # USER SETTINGS
 # ============================================================
-SYMBOL = "HYPEUSDT"
+SYMBOLS = ["WHALEUSDT", "HYPEUSDT", "JASMYUSDT"]
 INTERVAL = "5"                 # HARD CODED 5m
 CATEGORY = "linear"
 
@@ -63,6 +64,7 @@ WFO_APPLY_ONLY_WHEN_FLAT = True
 KEEP_CANDLES = 3000
 PRINT_EVERY_CANDLE = True
 API_POLITE_SLEEP = 0.1
+REST_MIN_INTERVAL_SEC = 0.2
 
 # Live trading toggles (real orders)
 REAL_TRADING_ENABLED = False
@@ -70,6 +72,30 @@ API_KEY = "YOUR_BYBIT_API_KEY"
 API_SECRET = "YOUR_BYBIT_API_SECRET"
 RECV_WINDOW = "5000"
 CANDLE_STALENESS_MAX_SEC = 120
+
+# ============================================================
+# POSITION GATE (single open position across symbols)
+# ============================================================
+class PositionGate:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active_symbol: Optional[str] = None
+
+    def try_acquire(self, symbol: str) -> bool:
+        with self._lock:
+            if self._active_symbol is None:
+                self._active_symbol = symbol
+                return True
+            return self._active_symbol == symbol
+
+    def release(self, symbol: str) -> None:
+        with self._lock:
+            if self._active_symbol == symbol:
+                self._active_symbol = None
+
+    def force_acquire(self, symbol: str) -> None:
+        with self._lock:
+            self._active_symbol = symbol
 
 # ============================================================
 # LOGGING / FILE OUTPUT
@@ -120,12 +146,27 @@ ensure_csv(PARAMS_CSV_PATH, [
 # BYBIT REST HELPERS
 # ============================================================
 BASE_REST = "https://api.bybit.com"
+_REST_RATE_LOCK = threading.Lock()
+_REST_LAST_CALL = 0.0
+
+def _rate_limit_rest():
+    global _REST_LAST_CALL
+    if REST_MIN_INTERVAL_SEC <= 0:
+        return
+    with _REST_RATE_LOCK:
+        now = time.monotonic()
+        wait = _REST_LAST_CALL + REST_MIN_INTERVAL_SEC - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _REST_LAST_CALL = now
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
 def rest_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = BASE_REST + path
+    _rate_limit_rest()
     r = requests.get(url, params=params, timeout=30)
     j = r.json()
     if "retCode" not in j:
@@ -178,8 +219,10 @@ def rest_request(
         })
 
     if method.upper() == "GET":
+        _rate_limit_rest()
         r = requests.get(full_url, headers=headers, timeout=30)
     else:
+        _rate_limit_rest()
         r = requests.post(full_url, headers=headers, data=data, timeout=30)
 
     j = r.json()
@@ -769,6 +812,99 @@ class BybitPrivateClient:
                 raise RuntimeError("No usable USDT balance fields returned by Bybit")
         raise RuntimeError("USDT balance not found for accountType=UNIFIED")
 
+    def get_fund_usdt(self) -> Optional[float]:
+        try:
+            j = rest_request(
+                "GET",
+                "/v5/account/wallet-balance",
+                params={"accountType": "FUND"},
+                auth=True
+            )
+        except RuntimeError as exc:
+            if "accountType only support UNIFIED" in str(exc):
+                log.warning("FUND wallet not accessible on this account. Skipping transfer logic.")
+                return None
+            raise
+
+        rows = j["result"].get("list", [])
+        if not rows:
+            raise RuntimeError("No wallet balance returned for accountType=FUND")
+        for row in rows:
+            for coin in row.get("coin", []):
+                if coin.get("coin") != "USDT":
+                    continue
+                log.info("FUND USDT wallet object: %s", coin)
+                available_withdraw = coin.get("availableToWithdraw")
+                available_balance = coin.get("availableBalance")
+                wallet_balance = coin.get("walletBalance")
+
+                def _parse_value(value: Any) -> Optional[float]:
+                    if value is None:
+                        return None
+                    if isinstance(value, str) and not value.strip():
+                        return None
+                    try:
+                        return float(value)
+                    except Exception:
+                        return None
+
+                parsed_available_withdraw = _parse_value(available_withdraw)
+                if parsed_available_withdraw is not None and parsed_available_withdraw > 0:
+                    return parsed_available_withdraw
+
+                parsed_available_balance = _parse_value(available_balance)
+                if parsed_available_balance is not None and parsed_available_balance > 0:
+                    return parsed_available_balance
+
+                parsed_wallet_balance = _parse_value(wallet_balance)
+                if parsed_wallet_balance is not None:
+                    return parsed_wallet_balance
+
+                raise RuntimeError("No usable USDT balance fields returned by Bybit for FUND")
+        raise RuntimeError("USDT balance not found for accountType=FUND")
+
+    def transfer_fund_to_unified(self, amount: float) -> None:
+        if amount <= 0:
+            return
+        rest_request(
+            "POST",
+            "/v5/asset/transfer/inter-transfer",
+            body={
+                "fromAccountType": "FUND",
+                "toAccountType": "UNIFIED",
+                "coin": "USDT",
+                "amount": f"{amount:.8f}",
+            },
+            auth=True
+        )
+
+    def ensure_unified_balance(self, required_amount: float) -> float:
+        unified = self.get_unified_usdt()
+        log.info("Unified available USDT balance: %.2f", unified)
+        log.info("Required margin (USDT): %.2f", required_amount)
+
+        if unified >= required_amount:
+            return unified
+
+        fund = self.get_fund_usdt()
+        if fund is None:
+            raise RuntimeError("Unified balance insufficient and FUND wallet not accessible")
+        log.info("Funding available USDT balance: %.2f", fund)
+        if fund <= 0:
+            raise RuntimeError("Not enough funds in FUND or UNIFIED")
+
+        need = required_amount - unified
+        to_transfer = min(need, fund)
+        log.info("Transferring %.2f USDT from FUND to UNIFIED.", to_transfer)
+        self.transfer_fund_to_unified(to_transfer)
+        time.sleep(2)
+
+        unified_after = self.get_unified_usdt()
+        log.info("Unified USDT balance after transfer: %.2f", unified_after)
+        if unified_after < required_amount:
+            raise RuntimeError("Auto-transfer failed to fund Unified wallet")
+        return unified_after
+
     def set_position_mode(self, symbol: str, mode: int = 0):
         rest_request(
             "POST",
@@ -872,13 +1008,13 @@ class BybitPrivateClient:
             raise RuntimeError("No instrument info returned")
         return rows[0]
 
-    def _fetch_executions(self, order_id: str) -> List[Dict[str, Any]]:
+    def _fetch_executions(self, symbol: str, order_id: str) -> List[Dict[str, Any]]:
         cursor = None
         executions: List[Dict[str, Any]] = []
         while True:
             params = {
                 "category": CATEGORY,
-                "symbol": SYMBOL,
+                "symbol": symbol,
                 "orderId": order_id,
                 "limit": 50
             }
@@ -900,13 +1036,14 @@ class BybitPrivateClient:
 
     def get_execution_summary(
         self,
+        symbol: str,
         order_id: str,
         timeout_sec: float = 3.0,
         poll_interval: float = 0.2
     ) -> Optional[Dict[str, float]]:
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
-            executions = self._fetch_executions(order_id)
+            executions = self._fetch_executions(symbol, order_id)
             if executions:
                 total_qty = 0.0
                 total_notional = 0.0
@@ -932,7 +1069,17 @@ class LivePaperTrader:
     - Logs every entry/exit (TP, mean reversion, liquidation) to trades.csv.
     - Walk-forward optimisation can run periodically and apply new params (optionally only when flat).
     """
-    def __init__(self, df_last_seed: pd.DataFrame, df_mark_seed: pd.DataFrame, risk_df: pd.DataFrame, params: Params):
+    def __init__(
+        self,
+        symbol: str,
+        df_last_seed: pd.DataFrame,
+        df_mark_seed: pd.DataFrame,
+        risk_df: pd.DataFrame,
+        params: Params,
+        gate: PositionGate
+    ):
+        self.symbol = symbol
+        self.gate = gate
         self.risk_df = risk_df
 
         self.params = params
@@ -1093,8 +1240,8 @@ class LivePaperTrader:
             end_ts = now_ms()
             start_ts = end_ts - int(WFO_LOOKBACK_CANDLES * 5 * 60 * 1000)
 
-            dfl = fetch_last_klines(SYMBOL, INTERVAL, start_ts, end_ts)
-            dfm = fetch_mark_klines(SYMBOL, INTERVAL, start_ts, end_ts)
+            dfl = fetch_last_klines(self.symbol, INTERVAL, start_ts, end_ts)
+            dfm = fetch_mark_klines(self.symbol, INTERVAL, start_ts, end_ts)
 
             opt = optimise_random(dfl, dfm, self.risk_df, trials=WFO_TRIALS, lookback_candles=min(WFO_LOOKBACK_CANDLES, len(dfl)), event_name="WFO_REOPT")
             bp = opt["best_params"]
@@ -1181,6 +1328,7 @@ class LivePaperTrader:
 
             self.wallet = 0.0
             self.position = None
+            self.gate.release(self.symbol)
             return
 
     # ----------------------------
@@ -1241,6 +1389,8 @@ class LivePaperTrader:
         # ENTRY (short only, single)
         # ----------------------------
         if entry_signal != 0 and self.position is None and self.wallet > 0:
+            if not self.gate.try_acquire(self.symbol):
+                return
             wallet_before = self.wallet
             fill = apply_slippage(c, "sell")
 
@@ -1393,6 +1543,7 @@ class LivePaperTrader:
             )
 
             self.position = None
+            self.gate.release(self.symbol)
             self._maybe_apply_pending_params()
             return
 
@@ -1448,6 +1599,7 @@ class LivePaperTrader:
             )
 
             self.position = None
+            self.gate.release(self.symbol)
             self._maybe_apply_pending_params()
             return
 
@@ -1468,21 +1620,27 @@ class LiveRealTrader:
     """
     def __init__(
         self,
+        symbol: str,
         df_last_seed: pd.DataFrame,
         df_mark_seed: pd.DataFrame,
         risk_df: pd.DataFrame,
         params: Params,
-        client: BybitPrivateClient
+        client: BybitPrivateClient,
+        gate: PositionGate
     ):
+        self.symbol = symbol
+        self.gate = gate
         self.client = client
         self.risk_df = risk_df
         self.params = params
         self.pending_params: Optional[Params] = None
-        self.instrument = self.client.get_instrument_info(SYMBOL)
+        self.instrument = self.client.get_instrument_info(self.symbol)
 
         self.wallet = float(self.client.get_unified_usdt())
         self.initial_wallet = self.wallet
-        self.position: Optional[RealPosition] = self.client.get_position(SYMBOL)
+        self.position: Optional[RealPosition] = self.client.get_position(self.symbol)
+        if self.position is not None:
+            self.gate.force_acquire(self.symbol)
 
         self.df = df_last_seed[["ts","open","high","low","close"]].copy().reset_index(drop=True)
         self.closed_candle_count = 0
@@ -1529,8 +1687,8 @@ class LiveRealTrader:
             end_ts = now_ms()
             start_ts = end_ts - int(WFO_LOOKBACK_CANDLES * 5 * 60 * 1000)
 
-            dfl = fetch_last_klines(SYMBOL, INTERVAL, start_ts, end_ts)
-            dfm = fetch_mark_klines(SYMBOL, INTERVAL, start_ts, end_ts)
+            dfl = fetch_last_klines(self.symbol, INTERVAL, start_ts, end_ts)
+            dfm = fetch_mark_klines(self.symbol, INTERVAL, start_ts, end_ts)
 
             opt = optimise_random(dfl, dfm, self.risk_df, trials=WFO_TRIALS, lookback_candles=min(WFO_LOOKBACK_CANDLES, len(dfl)), event_name="WFO_REOPT")
             bp = opt["best_params"]
@@ -1542,7 +1700,7 @@ class LiveRealTrader:
 
     def _refresh_state(self):
         self.wallet = float(self.client.get_unified_usdt())
-        self.position = self.client.get_position(SYMBOL)
+        self.position = self.client.get_position(self.symbol)
 
     def _format_qty(self, raw_qty: float) -> float:
         lot_filter = self.instrument.get("lotSizeFilter", {})
@@ -1713,12 +1871,14 @@ class LiveRealTrader:
         if entry_signal != 0 and self.position is None:
             wallet_before = self.wallet
             try:
+                if not self.gate.try_acquire(self.symbol):
+                    return
                 qty = self._format_qty((self.wallet * float(USE_FRACTION) * float(LEVERAGE)) / c)
                 self._ensure_entry_risk_checks(qty, c, wallet_before)
-                order_id = self.client.place_market_order(SYMBOL, "Sell", qty, reduce_only=False)
+                order_id = self.client.place_market_order(self.symbol, "Sell", qty, reduce_only=False)
                 self._refresh_state()
-                summary = self.client.get_execution_summary(order_id)
-                fill_price = summary["avg_price"] if summary else fetch_last_price(SYMBOL)
+                summary = self.client.get_execution_summary(self.symbol, order_id)
+                fill_price = summary["avg_price"] if summary else fetch_last_price(self.symbol)
                 filled_qty = summary["qty"] if summary else qty
                 self._log_real_trade(
                     ts_utc=ts_utc,
@@ -1732,7 +1892,10 @@ class LiveRealTrader:
                     wallet_after=self.wallet
                 )
             except Exception as e:
+                self.gate.release(self.symbol)
                 log.error(f"[{ts_utc}] Entry order aborted: {e}")
+            if self.position is None:
+                self.gate.release(self.symbol)
             return
 
         if self.position is None:
@@ -1754,10 +1917,10 @@ class LiveRealTrader:
             wallet_before = self.wallet
             try:
                 qty_to_close = self._format_qty(qty_abs)
-                order_id = self.client.place_market_order(SYMBOL, "Buy", qty_to_close, reduce_only=True)
+                order_id = self.client.place_market_order(self.symbol, "Buy", qty_to_close, reduce_only=True)
                 self._refresh_state()
-                summary = self.client.get_execution_summary(order_id)
-                fill_price = summary["avg_price"] if summary else fetch_last_price(SYMBOL)
+                summary = self.client.get_execution_summary(self.symbol, order_id)
+                fill_price = summary["avg_price"] if summary else fetch_last_price(self.symbol)
                 filled_qty = summary["qty"] if summary else qty_to_close
                 reason = "TP" if l <= tp_price else "MEAN_REVERSION"
                 self._log_real_trade(
@@ -1773,12 +1936,14 @@ class LiveRealTrader:
                 )
             except Exception as e:
                 log.error(f"[{ts_utc}] Exit order failed: {e}")
+            if self.position is None:
+                self.gate.release(self.symbol)
 # ============================================================
 # HYPEUSDT SHORT GRID — EXACT BYBIT ENGINE (PART 4/4)
 # WebSocket (auto-reconnect, passive ping) + main() glue
 # ============================================================
 
-def start_live_ws(trader):
+def start_live_ws(traders: Dict[str, Any]):
     """
     Bybit public WS:
       - tickers.{SYMBOL} -> markPrice updates (liquidation trigger)
@@ -1789,15 +1954,15 @@ def start_live_ws(trader):
       - No ping spam (ping only if needed)
     """
     ws_url = "wss://stream.bybit.com/v5/public/linear"
-    topic_k = f"kline.{INTERVAL}.{SYMBOL}"
-    topic_t = f"tickers.{SYMBOL}"
+    topic_k = [f"kline.{INTERVAL}.{symbol}" for symbol in traders]
+    topic_t = [f"tickers.{symbol}" for symbol in traders]
 
     last_msg_time = {"t": time.time()}
     last_ping_time = {"t": 0.0}
 
     def on_open(ws):
-        ws.send(json.dumps({"op": "subscribe", "args": [topic_k, topic_t]}))
-        log.info(f"WebSocket connected. Subscribed: {topic_k} and {topic_t}")
+        ws.send(json.dumps({"op": "subscribe", "args": topic_k + topic_t}))
+        log.info(f"WebSocket connected. Subscribed: {', '.join(topic_k + topic_t)}")
         log.info("Live trading started. Stop with Ctrl+C.\n")
 
     def on_message(ws, message):
@@ -1814,9 +1979,19 @@ def start_live_ws(trader):
 
         topic = msg.get("topic", "")
         data = msg.get("data")
+        symbol = None
+        if topic.startswith("kline."):
+            parts = topic.split(".")
+            if len(parts) >= 3:
+                symbol = parts[2]
+        elif topic.startswith("tickers."):
+            symbol = topic.split(".", 1)[1]
+        if symbol is None or symbol not in traders:
+            return
+        trader = traders[symbol]
 
         # Mark price updates
-        if topic == topic_t and data:
+        if topic in topic_t and data:
             if isinstance(data, list) and len(data) > 0:
                 d = data[0]
             elif isinstance(data, dict):
@@ -1831,7 +2006,7 @@ def start_live_ws(trader):
             return
 
         # Closed 5m candles
-        if topic == topic_k and data:
+        if topic in topic_k and data:
             for c in data:
                 if c.get("confirm") is True:
                     trader.on_closed_candle(c)
@@ -1873,16 +2048,16 @@ def start_live_ws(trader):
         time.sleep(5)
 
 
-def download_seed_history(days_back: int):
+def download_seed_history(symbol: str, days_back: int):
     end_ts = now_ms()
     start_ts = end_ts - int(days_back * 24 * 60 * 60 * 1000)
 
-    log.info(f"Downloading LAST-price 5m history for {SYMBOL} (past {days_back} days)...")
-    df_last = fetch_last_klines(SYMBOL, INTERVAL, start_ts, end_ts)
+    log.info(f"Downloading LAST-price 5m history for {symbol} (past {days_back} days)...")
+    df_last = fetch_last_klines(symbol, INTERVAL, start_ts, end_ts)
     log.info(f"Last-price candles: {len(df_last)}")
 
-    log.info(f"Downloading MARK-price 5m history for {SYMBOL} (past {days_back} days)...")
-    df_mark = fetch_mark_klines(SYMBOL, INTERVAL, start_ts, end_ts)
+    log.info(f"Downloading MARK-price 5m history for {symbol} (past {days_back} days)...")
+    df_mark = fetch_mark_klines(symbol, INTERVAL, start_ts, end_ts)
     log.info(f"Mark-price candles: {len(df_mark)}")
 
     return df_last, df_mark
@@ -1911,89 +2086,95 @@ def main():
         raise RuntimeError("Live wallet usage requires BYBIT_API_KEY and BYBIT_API_SECRET.")
     client = BybitPrivateClient()
     unified_balance = float(client.get_unified_usdt())
-    required_amount = unified_balance
-    log.info(f"Unified available USDT balance: {unified_balance:.2f}")
-    log.info(f"Required margin (USDT): {required_amount:.2f}")
-
-    if unified_balance <= 0:
-        raise RuntimeError("Unified available balance is zero; cannot proceed with trading.")
+    required_amount = unified_balance if unified_balance > 0 else float(STARTING_WALLET)
+    unified_balance = client.ensure_unified_balance(required_amount)
 
     globals()["STARTING_WALLET"] = unified_balance
     log.info(f"Using live wallet balance for backtest baseline: {unified_balance:.2f} USDT")
 
-    # 1) Download seed history so indicators are warmed up
-    df_last, df_mark = download_seed_history(DAYS_BACK_SEED)
+    gate = PositionGate()
+    traders: Dict[str, Any] = {}
+    for symbol in SYMBOLS:
+        # 1) Download seed history so indicators are warmed up
+        df_last, df_mark = download_seed_history(symbol, DAYS_BACK_SEED)
 
-    # 2) Risk tiers for liquidation model
-    log.info(f"Fetching risk tiers for {SYMBOL} ...")
-    risk_df = fetch_risk_tiers(SYMBOL)
-    log.info(f"Risk tiers loaded: {len(risk_df)}")
+        # 2) Risk tiers for liquidation model
+        log.info(f"Fetching risk tiers for {symbol} ...")
+        risk_df = fetch_risk_tiers(symbol)
+        log.info(f"Risk tiers loaded: {len(risk_df)}")
 
-    # 3) Initial optimisation (random search)
-    log.info(
-        f"Running initial optimisation: trials={INIT_TRIALS}, wallet={STARTING_WALLET:.2f}USDT, "
-        f"leverage={LEVERAGE}x, fee={FEE_RATE*100:.4f}%/side"
-    )
-
-    opt = optimise_random(
-        df_last=df_last,
-        df_mark=df_mark,
-        risk_df=risk_df,
-        trials=INIT_TRIALS,
-        lookback_candles=min(len(df_last), len(df_mark)),
-        event_name="INIT_OPT"
-    )
-
-    best_params = opt["best_params"]
-    best_result = opt["best_result"]
-
-    log.info(pretty_opt_summary(best_params, best_result))
-
-    # 4) Start live trading using optimal params
-    params = Params(
-        ma_len=int(best_params["ma_len"]),
-        band_mult=float(best_params["band_mult"]),
-        tp_perc=float(best_params["tp_perc"])
-    )
-
-    if REAL_TRADING_ENABLED:
-        if client is None:
-            client = BybitPrivateClient()
-        client.ensure_futures_setup(SYMBOL)
-        trader = LiveRealTrader(
-            df_last_seed=df_last,
-            df_mark_seed=df_mark,
-            risk_df=risk_df,
-            params=params,
-            client=client
+        # 3) Initial optimisation (random search)
+        log.info(
+            f"Running initial optimisation for {symbol}: trials={INIT_TRIALS}, "
+            f"wallet={STARTING_WALLET:.2f}USDT, leverage={LEVERAGE}x, "
+            f"fee={FEE_RATE*100:.4f}%/side"
         )
-        log.info("REAL TRADING ENABLED: sending live orders to Bybit.")
-    else:
-        trader = LivePaperTrader(
-            df_last_seed=df_last,
-            df_mark_seed=df_mark,
+
+        opt = optimise_random(
+            df_last=df_last,
+            df_mark=df_mark,
             risk_df=risk_df,
-            params=params
+            trials=INIT_TRIALS,
+            lookback_candles=min(len(df_last), len(df_mark)),
+            event_name=f"INIT_OPT_{symbol}"
         )
+
+        best_params = opt["best_params"]
+        best_result = opt["best_result"]
+
+        log.info(f"{symbol} {pretty_opt_summary(best_params, best_result)}")
+
+        # 4) Start live trading using optimal params
+        params = Params(
+            ma_len=int(best_params["ma_len"]),
+            band_mult=float(best_params["band_mult"]),
+            tp_perc=float(best_params["tp_perc"])
+        )
+
+        if REAL_TRADING_ENABLED:
+            if client is None:
+                client = BybitPrivateClient()
+            client.ensure_futures_setup(symbol)
+            trader = LiveRealTrader(
+                symbol=symbol,
+                df_last_seed=df_last,
+                df_mark_seed=df_mark,
+                risk_df=risk_df,
+                params=params,
+                client=client,
+                gate=gate
+            )
+            log.info(f"REAL TRADING ENABLED: sending live orders to Bybit for {symbol}.")
+        else:
+            trader = LivePaperTrader(
+                symbol=symbol,
+                df_last_seed=df_last,
+                df_mark_seed=df_mark,
+                risk_df=risk_df,
+                params=params,
+                gate=gate
+            )
+        traders[symbol] = trader
 
     # 5) Live WS (auto reconnect)
     try:
-        start_live_ws(trader)
+        start_live_ws(traders)
     except KeyboardInterrupt:
-        # summary on stop
-        baseline_wallet = getattr(trader, "initial_wallet", float(STARTING_WALLET))
-        pnl_usdt = trader.wallet - float(baseline_wallet)
-        pnl_pct = (pnl_usdt / float(baseline_wallet)) * 100.0 if baseline_wallet else 0.0
-        wr = (trader.win_count / trader.trade_count * 100.0) if trader.trade_count else 0.0
-
         log.info("\nStopped by user.")
         log.info("=============== SUMMARY ===============")
-        log.info(f"Final wallet: {trader.wallet:.2f} USDT")
-        log.info(f"PnL (wallet): {pnl_usdt:.2f} USDT ({pnl_pct:.2f}%)")
-        log.info(f"Trades:       {trader.trade_count}")
-        log.info(f"Winrate:      {wr:.2f}%")
-        log.info(f"Sum PnL 1x (gross move):   {trader.realized_pnl_1x_gross:.2f} USDT")
-        log.info(f"Sum PnL 10x (net wallet):  {trader.realized_pnl_10x_net:.2f} USDT")
+        for symbol, trader in traders.items():
+            baseline_wallet = getattr(trader, "initial_wallet", float(STARTING_WALLET))
+            pnl_usdt = trader.wallet - float(baseline_wallet)
+            pnl_pct = (pnl_usdt / float(baseline_wallet)) * 100.0 if baseline_wallet else 0.0
+            wr = (trader.win_count / trader.trade_count * 100.0) if trader.trade_count else 0.0
+
+            log.info(f"Symbol: {symbol}")
+            log.info(f"Final wallet: {trader.wallet:.2f} USDT")
+            log.info(f"PnL (wallet): {pnl_usdt:.2f} USDT ({pnl_pct:.2f}%)")
+            log.info(f"Trades:       {trader.trade_count}")
+            log.info(f"Winrate:      {wr:.2f}%")
+            log.info(f"Sum PnL 1x (gross move):   {trader.realized_pnl_1x_gross:.2f} USDT")
+            log.info(f"Sum PnL 10x (net wallet):  {trader.realized_pnl_10x_net:.2f} USDT")
         log.info(f"Logs directory: {LOG_DIR}")
         log.info("=======================================")
 
