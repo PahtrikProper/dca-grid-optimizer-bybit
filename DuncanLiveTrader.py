@@ -1102,6 +1102,8 @@ class LivePaperTrader:
         self.win_count = 0
         self.realized_pnl_10x_net = 0.0
         self.realized_pnl_1x_gross = 0.0
+        self.account_pnl_usdt = 0.0
+        self.account_pnl_pct = 0.0
 
         self._recompute_indicators()
 
@@ -1701,6 +1703,11 @@ class LiveRealTrader:
     def _refresh_state(self):
         self.wallet = float(self.client.get_unified_usdt())
         self.position = self.client.get_position(self.symbol)
+        self.account_pnl_usdt = self.wallet - float(self.initial_wallet)
+        self.account_pnl_pct = (
+            (self.account_pnl_usdt / float(self.initial_wallet)) * 100.0
+            if self.initial_wallet else 0.0
+        )
 
     def _format_qty(self, raw_qty: float) -> float:
         lot_filter = self.instrument.get("lotSizeFilter", {})
@@ -1900,8 +1907,8 @@ class LiveRealTrader:
 
         if self.position is None:
             if PRINT_EVERY_CANDLE:
-                pnl_usdt = self.wallet - float(self.initial_wallet)
-                pnl_pct = (pnl_usdt / float(self.initial_wallet)) * 100.0 if self.initial_wallet else 0.0
+                pnl_usdt = self.account_pnl_usdt
+                pnl_pct = self.account_pnl_pct
                 log.info(
                     f"[{ts_utc}] FLAT close={c:.8f} mark={self.mark_price:.8f} "
                     f"wallet={self.wallet:.2f} pnl={pnl_usdt:.2f} ({pnl_pct:.2f}%)"
