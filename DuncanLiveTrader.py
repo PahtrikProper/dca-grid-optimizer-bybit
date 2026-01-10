@@ -245,13 +245,24 @@ def rest_request(
         log.error("Bybit REST unexpected response: %s", j)
         raise RuntimeError(f"Bybit REST unexpected response: {j}")
     if j["retCode"] != 0:
-        log.error(
-            "Bybit REST error retCode=%s retMsg=%s params=%s body=%s",
-            j.get("retCode"),
-            j.get("retMsg"),
-            params,
-            body
-        )
+        ret_code = j.get("retCode")
+        ret_msg = j.get("retMsg")
+        if ret_code in (110043, 10001):
+            log.warning(
+                "Bybit REST warning retCode=%s retMsg=%s params=%s body=%s",
+                ret_code,
+                ret_msg,
+                params,
+                body
+            )
+        else:
+            log.error(
+                "Bybit REST error retCode=%s retMsg=%s params=%s body=%s",
+                ret_code,
+                ret_msg,
+                params,
+                body
+            )
         raise RuntimeError(f"Bybit REST error retCode={j['retCode']} retMsg={j.get('retMsg')} params={params} body={body}")
     return j
 
@@ -961,26 +972,30 @@ class BybitPrivateClient:
             log.warning("set_margin_mode skipped for %s: %s", symbol, exc)
 
     def set_leverage(self, symbol: str, buy_leverage: float, sell_leverage: float):
-        rest_request(
-            "POST",
-            "/v5/position/set-leverage",
-            body={
-                "category": CATEGORY,
-                "symbol": symbol,
-                "buyLeverage": str(buy_leverage),
-                "sellLeverage": str(sell_leverage)
-            },
-            auth=True
-        )
+        try:
+            rest_request(
+                "POST",
+                "/v5/position/set-leverage",
+                body={
+                    "category": CATEGORY,
+                    "symbol": symbol,
+                    "buyLeverage": str(buy_leverage),
+                    "sellLeverage": str(sell_leverage)
+                },
+                auth=True
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "110043" in msg or "not modified" in msg or "10001" in msg:
+                log.info("Leverage already set or cannot be changed for %s. Skipping.", symbol)
+                return
+            raise
 
     def ensure_futures_setup(self, symbol: str):
         # Unified accounts: margin/position mode changes via API are unreliable or forbidden.
         # These must be set manually in the UI.
         # We only enforce leverage here.
-        try:
-            self.set_leverage(symbol, LEVERAGE, LEVERAGE)
-        except Exception as exc:
-            log.warning("set_leverage failed or skipped for %s: %s", symbol, exc)
+        self.set_leverage(symbol, LEVERAGE, LEVERAGE)
 
     def get_wallet_balance(self) -> float:
         return self.get_unified_usdt()
