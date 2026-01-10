@@ -32,7 +32,12 @@ CATEGORY = "linear"
 
 DAYS_BACK_SEED = 7             # initial history window
 STARTING_WALLET = 500.0
-LEVERAGE = 10.0
+DEFAULT_LEVERAGE = 5.0
+LEVERAGE_BY_SYMBOL = {
+    "WHITEWHALEUSDT": 5.0,
+    "HYPEUSDT": 10.0,
+    "SOLUSDT": 10.0,
+}
 USE_FRACTION = 0.95
 
 # TradingView commission_value=0.01 => 0.01% = 0.0001
@@ -162,6 +167,9 @@ def _rate_limit_rest():
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+def leverage_for(symbol: str) -> float:
+    return float(LEVERAGE_BY_SYMBOL.get(symbol, DEFAULT_LEVERAGE))
 
 def rest_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = BASE_REST + path
@@ -561,7 +569,8 @@ def backtest_once(
     risk_df: pd.DataFrame,
     ma_len: int,
     band_mult: float,
-    tp_perc: float
+    tp_perc: float,
+    leverage: float
 ) -> Optional[BacktestResult]:
     """
     Uses:
@@ -570,7 +579,7 @@ def backtest_once(
     Applies:
       - Fees per side on notional (TradingView-style)
       - Slippage on fills
-      - 10x leverage (notional = wallet * leverage at entry)
+      - Leverage (notional = wallet * leverage at entry)
       - Single position only
     """
     ma_len = int(ma_len)
@@ -635,7 +644,7 @@ def backtest_once(
         # -------- ENTRY (short only, single entry) --------
         if entry_signal_level != 0 and pos_qty == 0.0 and wallet > 0.0:
             fill = apply_slippage(close, "sell")
-            notional = wallet * float(LEVERAGE)
+            notional = wallet * float(leverage)
             qty = notional / fill
 
             fee = notional * float(FEE_RATE)
@@ -657,7 +666,7 @@ def backtest_once(
             liq = liquidation_price_short_isolated(
                 entry_price=entry_price,
                 qty_short=pos_qty,
-                leverage=LEVERAGE,
+                leverage=leverage,
                 mark_price=mark_close,
                 tier=tier,
                 fee_rate=FEE_RATE,
@@ -729,7 +738,8 @@ def optimise_random(
     risk_df: pd.DataFrame,
     trials: int,
     lookback_candles: int,
-    event_name: str
+    event_name: str,
+    leverage: float
 ) -> Dict[str, Any]:
     """
     Random search over (MA_LEN, BAND_MULT, TP_PERC)
@@ -749,7 +759,7 @@ def optimise_random(
         band = random.uniform(BAND_MULT_RANGE[0], BAND_MULT_RANGE[1])
         tp = random.uniform(TP_RANGE[0], TP_RANGE[1])
 
-        res = backtest_once(dfl, dfm, risk_df, ma, band, tp)
+        res = backtest_once(dfl, dfm, risk_df, ma, band, tp, leverage)
         if res is None:
             continue
 
@@ -956,6 +966,7 @@ class BybitPrivateClient:
 
     def set_margin_mode(self, symbol: str, trade_mode: int = 1):
         try:
+            leverage = leverage_for(symbol)
             rest_request(
                 "POST",
                 "/v5/position/set-margin-mode",
@@ -963,8 +974,8 @@ class BybitPrivateClient:
                     "category": CATEGORY,
                     "symbol": symbol,
                     "tradeMode": trade_mode,
-                    "buyLeverage": str(LEVERAGE),
-                    "sellLeverage": str(LEVERAGE)
+                    "buyLeverage": str(leverage),
+                    "sellLeverage": str(leverage)
                 },
                 auth=True
             )
@@ -995,7 +1006,8 @@ class BybitPrivateClient:
         # Unified accounts: margin/position mode changes via API are unreliable or forbidden.
         # These must be set manually in the UI.
         # We only enforce leverage here.
-        self.set_leverage(symbol, LEVERAGE, LEVERAGE)
+        leverage = leverage_for(symbol)
+        self.set_leverage(symbol, leverage, leverage)
 
     def get_wallet_balance(self) -> float:
         return self.get_unified_usdt()
@@ -1158,6 +1170,8 @@ class LivePaperTrader:
         self.symbol = symbol
         self.gate = gate
         self.risk_df = risk_df
+
+        self.leverage = leverage_for(symbol)
 
         self.params = params
         self.pending_params: Optional[Params] = None
@@ -1322,7 +1336,15 @@ class LivePaperTrader:
             dfl = fetch_last_klines(self.symbol, INTERVAL, start_ts, end_ts)
             dfm = fetch_mark_klines(self.symbol, INTERVAL, start_ts, end_ts)
 
-            opt = optimise_random(dfl, dfm, self.risk_df, trials=WFO_TRIALS, lookback_candles=min(WFO_LOOKBACK_CANDLES, len(dfl)), event_name="WFO_REOPT")
+            opt = optimise_random(
+                dfl,
+                dfm,
+                self.risk_df,
+                trials=WFO_TRIALS,
+                lookback_candles=min(WFO_LOOKBACK_CANDLES, len(dfl)),
+                event_name="WFO_REOPT",
+                leverage=self.leverage
+            )
             bp = opt["best_params"]
 
             self.pending_params = Params(int(bp["ma_len"]), float(bp["band_mult"]), float(bp["tp_perc"]))
@@ -1349,7 +1371,7 @@ class LivePaperTrader:
         liq = liquidation_price_short_isolated(
             entry_price=pos.entry_price,
             qty_short=pos.qty,
-            leverage=LEVERAGE,
+            leverage=self.leverage,
             mark_price=self.mark_price,
             tier=tier,
             fee_rate=FEE_RATE,
@@ -1474,7 +1496,7 @@ class LivePaperTrader:
             fill = apply_slippage(c, "sell")
 
             margin = self.wallet * float(USE_FRACTION)
-            notional = margin * float(LEVERAGE)
+            notional = margin * float(self.leverage)
             qty = notional / fill
 
             fee_entry = notional * float(FEE_RATE)
@@ -1499,7 +1521,7 @@ class LivePaperTrader:
             liq = liquidation_price_short_isolated(
                 entry_price=pos.entry_price,
                 qty_short=pos.qty,
-                leverage=LEVERAGE,
+                leverage=self.leverage,
                 mark_price=self.mark_price,
                 tier=tier,
                 fee_rate=FEE_RATE,
@@ -1558,7 +1580,7 @@ class LivePaperTrader:
         liq = liquidation_price_short_isolated(
             entry_price=pos.entry_price,
             qty_short=pos.qty,
-            leverage=LEVERAGE,
+            leverage=self.leverage,
             mark_price=self.mark_price,
             tier=tier,
             fee_rate=FEE_RATE,
@@ -1711,6 +1733,7 @@ class LiveRealTrader:
         self.gate = gate
         self.client = client
         self.risk_df = risk_df
+        self.leverage = leverage_for(symbol)
         self.params = params
         self.pending_params: Optional[Params] = None
         self.instrument = self.client.get_instrument_info(self.symbol)
@@ -1769,7 +1792,15 @@ class LiveRealTrader:
             dfl = fetch_last_klines(self.symbol, INTERVAL, start_ts, end_ts)
             dfm = fetch_mark_klines(self.symbol, INTERVAL, start_ts, end_ts)
 
-            opt = optimise_random(dfl, dfm, self.risk_df, trials=WFO_TRIALS, lookback_candles=min(WFO_LOOKBACK_CANDLES, len(dfl)), event_name="WFO_REOPT")
+            opt = optimise_random(
+                dfl,
+                dfm,
+                self.risk_df,
+                trials=WFO_TRIALS,
+                lookback_candles=min(WFO_LOOKBACK_CANDLES, len(dfl)),
+                event_name="WFO_REOPT",
+                leverage=self.leverage
+            )
             bp = opt["best_params"]
 
             self.pending_params = Params(int(bp["ma_len"]), float(bp["band_mult"]), float(bp["tp_perc"]))
@@ -1831,7 +1862,7 @@ class LiveRealTrader:
         if max_risk and notional > max_risk:
             raise RuntimeError(f"Order notional {notional:.6f} exceeds risk limit {max_risk:.6f}.")
 
-        margin_required = notional / float(LEVERAGE)
+        margin_required = notional / float(self.leverage)
         est_fee = notional * float(FEE_RATE)
         if wallet_before < (margin_required + est_fee):
             raise RuntimeError(
@@ -1957,7 +1988,7 @@ class LiveRealTrader:
             try:
                 if not self.gate.try_acquire(self.symbol):
                     return
-                qty = self._format_qty((self.wallet * float(USE_FRACTION) * float(LEVERAGE)) / c)
+                qty = self._format_qty((self.wallet * float(USE_FRACTION) * float(self.leverage)) / c)
                 self._ensure_entry_risk_checks(qty, c, wallet_before)
                 order_id = self.client.place_market_order(self.symbol, "Sell", qty, reduce_only=False)
                 self._refresh_state()
@@ -2186,6 +2217,7 @@ def main():
     gate = PositionGate()
     traders: Dict[str, Any] = {}
     for symbol in SYMBOLS:
+        leverage = leverage_for(symbol)
         # 1) Download seed history so indicators are warmed up
         df_last, df_mark = download_seed_history(symbol, DAYS_BACK_SEED)
 
@@ -2197,7 +2229,7 @@ def main():
         # 3) Initial optimisation (random search)
         log.info(
             f"Running initial optimisation for {symbol}: trials={INIT_TRIALS}, "
-            f"wallet={STARTING_WALLET:.2f}USDT, leverage={LEVERAGE}x, "
+            f"wallet={STARTING_WALLET:.2f}USDT, leverage={leverage}x, "
             f"fee={FEE_RATE*100:.4f}%/side"
         )
 
@@ -2207,7 +2239,8 @@ def main():
             risk_df=risk_df,
             trials=INIT_TRIALS,
             lookback_candles=min(len(df_last), len(df_mark)),
-            event_name=f"INIT_OPT_{symbol}"
+            event_name=f"INIT_OPT_{symbol}",
+            leverage=leverage
         )
 
         best_params = opt["best_params"]
