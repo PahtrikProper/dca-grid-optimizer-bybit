@@ -940,25 +940,25 @@ class BybitPrivateClient:
                 },
                 auth=True
             )
-        except RuntimeError as exc:
-            if "retCode=110025" in str(exc) or "Position mode is not modified" in str(exc):
-                log.info("Position mode already set for %s; skipping.", symbol)
-                return
-            raise
+        except Exception as exc:
+            log.warning("set_position_mode skipped for %s: %s", symbol, exc)
 
     def set_margin_mode(self, symbol: str, trade_mode: int = 1):
-        rest_request(
-            "POST",
-            "/v5/position/set-margin-mode",
-            body={
-                "category": CATEGORY,
-                "symbol": symbol,
-                "tradeMode": trade_mode,
-                "buyLeverage": str(LEVERAGE),
-                "sellLeverage": str(LEVERAGE)
-            },
-            auth=True
-        )
+        try:
+            rest_request(
+                "POST",
+                "/v5/position/set-margin-mode",
+                body={
+                    "category": CATEGORY,
+                    "symbol": symbol,
+                    "tradeMode": trade_mode,
+                    "buyLeverage": str(LEVERAGE),
+                    "sellLeverage": str(LEVERAGE)
+                },
+                auth=True
+            )
+        except Exception as exc:
+            log.warning("set_margin_mode skipped for %s: %s", symbol, exc)
 
     def set_leverage(self, symbol: str, buy_leverage: float, sell_leverage: float):
         rest_request(
@@ -974,9 +974,13 @@ class BybitPrivateClient:
         )
 
     def ensure_futures_setup(self, symbol: str):
-        self.set_position_mode(symbol, mode=0)
-        self.set_margin_mode(symbol, trade_mode=1)
-        self.set_leverage(symbol, LEVERAGE, LEVERAGE)
+        # Unified accounts: margin/position mode changes via API are unreliable or forbidden.
+        # These must be set manually in the UI.
+        # We only enforce leverage here.
+        try:
+            self.set_leverage(symbol, LEVERAGE, LEVERAGE)
+        except Exception as exc:
+            log.warning("set_leverage failed or skipped for %s: %s", symbol, exc)
 
     def get_wallet_balance(self) -> float:
         return self.get_unified_usdt()
