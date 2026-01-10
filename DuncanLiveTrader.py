@@ -28,7 +28,7 @@ from websocket import WebSocketApp
 SYMBOL = "HYPEUSDT"
 INTERVAL = "5"                 # HARD CODED 5m
 CATEGORY = "linear"
-ACCOUNT_TYPE = "CONTRACT"
+ACCOUNT_TYPE = "UNIFIED"
 
 DAYS_BACK_SEED = 7             # initial history window
 STARTING_WALLET = 500.0
@@ -770,12 +770,22 @@ class BybitPrivateClient:
         self.set_leverage(symbol, LEVERAGE, LEVERAGE)
 
     def get_wallet_balance(self) -> float:
-        j = rest_request(
-            "GET",
-            "/v5/account/wallet-balance",
-            params={"accountType": ACCOUNT_TYPE},
-            auth=True
-        )
+        try:
+            j = rest_request(
+                "GET",
+                "/v5/account/wallet-balance",
+                params={"accountType": ACCOUNT_TYPE},
+                auth=True
+            )
+        except RuntimeError as exc:
+            if "accountType only support UNIFIED" not in str(exc):
+                raise
+            j = rest_request(
+                "GET",
+                "/v5/account/wallet-balance",
+                params={"accountType": "UNIFIED"},
+                auth=True
+            )
         rows = j["result"]["list"]
         if not rows:
             raise RuntimeError("No wallet balance returned")
