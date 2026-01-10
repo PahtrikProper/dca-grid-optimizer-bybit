@@ -227,8 +227,16 @@ def rest_request(
 
     j = r.json()
     if "retCode" not in j:
+        log.error("Bybit REST unexpected response: %s", j)
         raise RuntimeError(f"Bybit REST unexpected response: {j}")
     if j["retCode"] != 0:
+        log.error(
+            "Bybit REST error retCode=%s retMsg=%s params=%s body=%s",
+            j.get("retCode"),
+            j.get("retMsg"),
+            params,
+            body
+        )
         raise RuntimeError(f"Bybit REST error retCode={j['retCode']} retMsg={j.get('retMsg')} params={params} body={body}")
     return j
 
@@ -998,6 +1006,21 @@ class BybitPrivateClient:
         )
         return j["result"]["orderId"]
 
+    def get_order_status(self, symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
+        j = rest_request(
+            "GET",
+            "/v5/order/history",
+            params={
+                "category": CATEGORY,
+                "symbol": symbol,
+                "orderId": order_id,
+                "limit": 1
+            },
+            auth=True
+        )
+        rows = j["result"].get("list", [])
+        return rows[0] if rows else None
+
     def get_instrument_info(self, symbol: str) -> Dict[str, Any]:
         j = rest_get("/v5/market/instruments-info", {
             "category": CATEGORY,
@@ -1060,6 +1083,20 @@ class BybitPrivateClient:
                         "qty": total_qty
                     }
             time.sleep(poll_interval)
+        order = self.get_order_status(symbol, order_id)
+        if order:
+            status = order.get("orderStatus")
+            filled = float(order.get("cumExecQty", 0) or 0)
+            avg = float(order.get("avgPrice", 0) or 0)
+            log.warning(
+                "Order %s status=%s cumExecQty=%s avgPrice=%s",
+                order_id,
+                status,
+                filled,
+                avg
+            )
+            if filled > 0 and avg > 0:
+                return {"avg_price": avg, "qty": filled}
         return None
 
 class LivePaperTrader:
@@ -1885,8 +1922,12 @@ class LiveRealTrader:
                 order_id = self.client.place_market_order(self.symbol, "Sell", qty, reduce_only=False)
                 self._refresh_state()
                 summary = self.client.get_execution_summary(self.symbol, order_id)
-                fill_price = summary["avg_price"] if summary else fetch_last_price(self.symbol)
-                filled_qty = summary["qty"] if summary else qty
+                if summary is None:
+                    log.error(f"[{ts_utc}] Entry order {order_id} has no execution summary; skipping log.")
+                    self.gate.release(self.symbol)
+                    return
+                fill_price = summary["avg_price"]
+                filled_qty = summary["qty"]
                 self._log_real_trade(
                     ts_utc=ts_utc,
                     action="ENTRY",
@@ -1927,8 +1968,11 @@ class LiveRealTrader:
                 order_id = self.client.place_market_order(self.symbol, "Buy", qty_to_close, reduce_only=True)
                 self._refresh_state()
                 summary = self.client.get_execution_summary(self.symbol, order_id)
-                fill_price = summary["avg_price"] if summary else fetch_last_price(self.symbol)
-                filled_qty = summary["qty"] if summary else qty_to_close
+                if summary is None:
+                    log.error(f"[{ts_utc}] Exit order {order_id} has no execution summary; skipping log.")
+                    return
+                fill_price = summary["avg_price"]
+                filled_qty = summary["qty"]
                 reason = "TP" if l <= tp_price else "MEAN_REVERSION"
                 self._log_real_trade(
                     ts_utc=ts_utc,
