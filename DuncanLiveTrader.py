@@ -770,6 +770,23 @@ class BybitPrivateClient:
         self.set_leverage(symbol, LEVERAGE, LEVERAGE)
 
     def get_wallet_balance(self) -> float:
+        if ACCOUNT_TYPE == "FUND":
+            j = rest_request(
+                "GET",
+                "/v5/asset/transfer/query-account-coins-balance",
+                params={"accountType": "FUND", "coin": "USDT"},
+                auth=True
+            )
+            rows = j["result"].get("balance", [])
+            for row in rows:
+                if row.get("coin") != "USDT":
+                    continue
+                value = row.get("walletBalance")
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    raise RuntimeError("USDT funding wallet balance value was empty or invalid")
+                return float(value)
+            raise RuntimeError("USDT funding wallet balance not found")
+
         j = rest_request(
             "GET",
             "/v5/account/wallet-balance",
