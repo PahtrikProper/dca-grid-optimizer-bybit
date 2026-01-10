@@ -1876,13 +1876,12 @@ def main():
         raise RuntimeError("This script is hard-coded to 5m candles only (INTERVAL must be '5').")
 
     client = None
-    if REAL_TRADING_ENABLED:
-        if not API_KEY or not API_SECRET:
-            raise RuntimeError("REAL_TRADING_ENABLED requires BYBIT_API_KEY and BYBIT_API_SECRET.")
-        client = BybitPrivateClient()
-        live_wallet = float(client.get_wallet_balance())
-        globals()["STARTING_WALLET"] = live_wallet
-        log.info(f"Using live wallet balance for backtest baseline: {live_wallet:.2f} USDT")
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("Live wallet usage requires BYBIT_API_KEY and BYBIT_API_SECRET.")
+    client = BybitPrivateClient()
+    live_wallet = float(client.get_wallet_balance())
+    globals()["STARTING_WALLET"] = live_wallet
+    log.info(f"Using live wallet balance for backtest baseline: {live_wallet:.2f} USDT")
 
     # 1) Download seed history so indicators are warmed up
     df_last, df_mark = download_seed_history(DAYS_BACK_SEED)
@@ -1894,7 +1893,7 @@ def main():
 
     # 3) Initial optimisation (random search)
     log.info(
-        f"Running initial optimisation: trials={INIT_TRIALS}, wallet={STARTING_WALLET}USDT, "
+        f"Running initial optimisation: trials={INIT_TRIALS}, wallet={STARTING_WALLET:.2f}USDT, "
         f"leverage={LEVERAGE}x, fee={FEE_RATE*100:.4f}%/side"
     )
 
